@@ -1,0 +1,42 @@
+---
+title: "CopulaMomentum Quantitative Strategy Proposal"
+author: Brayden Boyko & Shinto Kai
+date: "`r Sys.Date()`"
+format: 
+  html:
+    toc: true
+    toc-location: left
+    embed-resources: true
+editor: source
+---
+
+```{=html}
+<style type="text/css"> body, td {font-size: 12px;} code.r{font-size: 10px;} pre {font-size: 10px} </style>
+```
+
+```{r dataCollect, echo=FALSE, warning=FALSE}
+
+
+```
+
+```{r functions, echo=FALSE, warning=FALSE}
+
+
+```
+
+```{r samplePeriod, echo=FALSE, warning=FALSE}
+
+
+```
+
+```{r backTest, echo=FALSE, warning=FALSE}
+
+
+
+```
+
+The CopulaMomentum strategy...
+
+## Summary of Results
+
+
