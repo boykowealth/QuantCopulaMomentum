@@ -15,16 +15,203 @@ editor: source
 ```
 
 ```{r dataCollect, echo=FALSE, warning=FALSE}
+## Libraries
+library(tidyverse)
+library(rlang)
+library(purrr)
+library(lubridate)
+library(tidyquant)
+library(knitr)
+library(ggplot2)
+library(copula)
+library(fitdistrplus)
+library(VineCopula) 
+library(dplyr)
+library(tibble)
+
+
+## Portfolio Inputs
+
+tickers <- c("XLK",  # Technology
+             "XLV",  # Health Care
+             "XLF",  # Financials
+             "XLE",  # Energy
+             "XLI",  # Industrials
+             "XLU",  # Utilities
+             "XLY",  # Consumer Discretionary
+             "XLP",  # Consumer Staples
+             "XLB"  # Materials
+             )
+
+
+start_date <- "2022-10-01"
+end_date <- rollback(Sys.Date(), roll_to_first = FALSE)
+
+## Presentation Table
+present_table <- tibble::tibble(
+  Ticker = tickers
+)
+
+# This function takes tickers, start_data, and end_date as an input and returns a monthly return
+
+fetch_return_data <- function(tickers, start_date, end_date) {
+  # Retrieve the data from Yahoo Finance
+  data <- tq_get(tickers, from = start_date, to = end_date, get = "stock.prices")
+  
+  # Calculate the daily return
+  daily_returns <- data %>%
+    arrange(symbol, date) %>%
+    group_by(symbol) %>%
+    mutate(daily_return = (adjusted - lag(adjusted)) / lag(adjusted)) %>%
+    ungroup() %>%  
+    dplyr::select(date, symbol, daily_return) %>%
+    pivot_wider(names_from = symbol, values_from = daily_return) %>%
+    relocate(date) %>%
+    drop_na()
+  
+  return(daily_returns)
+}
+
+return_data <- fetch_return_data(tickers, start_date, end_date)
+
+```
+
+```{r CDF, echo=FALSE, warning=FALSE}
+# Filter returns to Q4 2022 period
+last_quarter_returns <- return_data %>%
+  filter(date >= as.Date("2022-10-01") & date <= as.Date("2022-12-31"))
+
+# Generate empirical CDF functions for each ETF
+empirical_cdfs <- last_quarter_returns %>%
+  dplyr::select(-date) %>%
+  map(~ ecdf(.x))  # Create an ECDF for each return series
+
+# Prepare data for CDF plotting: evaluate ECDF at each return
+cdf_plot_data <- last_quarter_returns %>%
+  dplyr::select(-date) %>%
+  pivot_longer(cols = everything(), names_to = "Ticker", values_to = "Return") %>%
+  rowwise() %>%
+  mutate(CDF = empirical_cdfs[[Ticker]](Return)) %>%
+  ungroup()
+
+# Plot empirical CDFs for each ETF
+ggplot(cdf_plot_data, aes(x = Return, y = CDF, color = Ticker)) +
+  geom_line(size = 1) +
+  labs(
+    title = "Empirical CDFs of ETF Daily Returns (Q4 2022)",
+    x = "Daily Return",
+    y = "Empirical Cumulative Probability"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
 
 
 ```
 
-```{r functions, echo=FALSE, warning=FALSE}
+```{r function, echo=FALSE, warning=FALSE}
+fit_copulas_with_crash_matrix <- function(data_set, p_1 = 0.05, p_2 = 0.05) {
+  
+  # Convert to pseudo-observations
+  pseudo_obs <- data_set %>%
+    dplyr::select(where(is.numeric)) %>%
+    map_df(~ rank(.x) / (length(.x) + 1))
 
+  # Generate ETF pairs
+  etf_pairs <- combn(names(pseudo_obs), 2, simplify = FALSE)
 
-```
+  # Fit copulas and compute AICs + joint crash probabilities
+  fit_copulas_for_pair <- function(u, v) {
+    copula_families <- list(
+      gaussian = normalCopula(0.5, dim = 2),
+      t        = tCopula(0.5, dim = 2, df = 4L),
+      clayton  = claytonCopula(1, dim = 2),
+      gumbel   = gumbelCopula(2, dim = 2),
+      frank    = frankCopula(5, dim = 2)
+    )
+    
+    aic_scores <- list()
+    crash_probs <- list()
+    
+    for (cop_name in names(copula_families)) {
+      cop <- copula_families[[cop_name]]
+      fit <- try(fitCopula(cop, cbind(u, v), method = "ml"), silent = TRUE)
+      
+      if (!inherits(fit, "try-error")) {
+        fitted_cop <- fit@copula
+        if (cop_name == "t") {
+          rho <- coef(fit)[1]
+          df  <- as.integer(round(coef(fit)["df"]))
+          fitted_cop <- tCopula(rho, dim = 2, df = df, dispstr = "un")
+        }
+        
+        aic_scores[[cop_name]] <- AIC(fit)
+        crash_probs[[cop_name]] <- pCopula(c(p_1, p_2), fitted_cop)
+      }
+    }
+    
+    list(aic = aic_scores, crash = crash_probs)
+  }
 
-```{r samplePeriod, echo=FALSE, warning=FALSE}
+  # Fit all pairs
+  copula_results <- map_dfr(etf_pairs, function(pair) {
+    u <- pseudo_obs[[pair[1]]]
+    v <- pseudo_obs[[pair[2]]]
+    result <- fit_copulas_for_pair(u, v)
+    
+    tibble(
+      ETF_1 = pair[1],
+      ETF_2 = pair[2],
+      BestCopula = if (length(result$aic) > 0) names(which.min(result$aic)) else NA,
+      AICs = list(result$aic),
+      CrashProbs = list(result$crash)
+    )
+  })
+
+  # Expand AIC and Crash Probabilities
+  copula_results_expanded <- copula_results %>%
+    unnest_wider(AICs, names_sep = "_aic_") %>%
+    unnest_wider(CrashProbs, names_sep = "_crash_")
+
+  # Matrix of Best Copulas
+  copula_matrix <- copula_results %>%
+    dplyr::select(ETF_1, ETF_2, BestCopula) %>%
+    pivot_wider(names_from = ETF_2, values_from = BestCopula)
+
+  # Matrix of Crash Probabilities using best copula
+  best_crash_matrix <- copula_results_expanded %>%
+    rowwise() %>%
+    mutate(
+      Crash_Prob = case_when(
+        BestCopula == "gaussian" ~ CrashProbs_crash_gaussian,
+        BestCopula == "t"        ~ CrashProbs_crash_t,
+        BestCopula == "clayton"  ~ CrashProbs_crash_clayton,
+        BestCopula == "gumbel"   ~ CrashProbs_crash_gumbel,
+        BestCopula == "frank"    ~ CrashProbs_crash_frank,
+        TRUE ~ NA_real_
+      )
+    ) %>%
+    ungroup() %>%
+    dplyr::select(ETF_1, ETF_2, Crash_Prob) %>%
+    pivot_wider(names_from = ETF_2, values_from = Crash_Prob)
+
+  # Return all outputs as a named list
+  return(list(
+    results_table = copula_results_expanded,
+    best_copula_matrix = copula_matrix,
+    crash_probability_matrix = best_crash_matrix
+  ))
+}
+
+copula_outputs <- fit_copulas_with_crash_matrix(
+  data_set = last_quarter_returns,
+  p_1 = 0.05,
+  p_2 = 0.05
+)
+
+# Access outputs
+copula_outputs$results_table
+copula_outputs$best_copula_matrix
+copula_outputs$crash_probability_matrix
 
 
 ```
