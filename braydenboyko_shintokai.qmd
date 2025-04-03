@@ -14,8 +14,8 @@ editor: source
 <style type="text/css"> body, td {font-size: 12px;} code.r{font-size: 10px;} pre {font-size: 10px} </style>
 ```
 
-```{r dataCollect, echo=FALSE, warning=FALSE}
-## Libraries
+```{r functions, echo=FALSE, warning=FALSE}
+
 library(tidyverse)
 library(rlang)
 library(purrr)
@@ -28,37 +28,13 @@ library(fitdistrplus)
 library(VineCopula) 
 library(dplyr)
 library(tibble)
-
-
-## Portfolio Inputs
-
-tickers <- c("XLK",  # Technology
-             "XLV",  # Health Care
-             "XLF",  # Financials
-             "XLE",  # Energy
-             "XLI",  # Industrials
-             "XLU",  # Utilities
-             "XLY",  # Consumer Discretionary
-             "XLP",  # Consumer Staples
-             "XLB"  # Materials
-             )
-
-
-start_date <- "2022-10-01"
-end_date <- rollback(Sys.Date(), roll_to_first = FALSE)
-
-## Presentation Table
-present_table <- tibble::tibble(
-  Ticker = tickers
-)
-
-# This function takes tickers, start_data, and end_date as an input and returns a monthly return
+library(forecast)
+library(tseries)
+library(stats)
 
 fetch_return_data <- function(tickers, start_date, end_date) {
-  # Retrieve the data from Yahoo Finance
   data <- tq_get(tickers, from = start_date, to = end_date, get = "stock.prices")
   
-  # Calculate the daily return
   daily_returns <- data %>%
     arrange(symbol, date) %>%
     group_by(symbol) %>%
@@ -72,44 +48,9 @@ fetch_return_data <- function(tickers, start_date, end_date) {
   return(daily_returns)
 }
 
-return_data <- fetch_return_data(tickers, start_date, end_date)
-
-```
-
-```{r CDF, echo=FALSE, warning=FALSE}
-# Filter returns to Q4 2022 period
-last_quarter_returns <- return_data %>%
-  filter(date >= as.Date("2022-10-01") & date <= as.Date("2022-12-31"))
-
-# Generate empirical CDF functions for each ETF
-empirical_cdfs <- last_quarter_returns %>%
-  dplyr::select(-date) %>%
-  map(~ ecdf(.x))  # Create an ECDF for each return series
-
-# Prepare data for CDF plotting: evaluate ECDF at each return
-cdf_plot_data <- last_quarter_returns %>%
-  dplyr::select(-date) %>%
-  pivot_longer(cols = everything(), names_to = "Ticker", values_to = "Return") %>%
-  rowwise() %>%
-  mutate(CDF = empirical_cdfs[[Ticker]](Return)) %>%
-  ungroup()
-
-# Plot empirical CDFs for each ETF
-ggplot(cdf_plot_data, aes(x = Return, y = CDF, color = Ticker)) +
-  geom_line(size = 1) +
-  labs(
-    title = "Empirical CDFs of ETF Daily Returns (Q4 2022)",
-    x = "Daily Return",
-    y = "Empirical Cumulative Probability"
-  ) +
-  theme_minimal() +
-  theme(legend.position = "bottom")
-
-
-```
-
-```{r function, echo=FALSE, warning=FALSE}
-fit_copulas_with_crash_matrix <- function(data_set, p_1 = 0.05, p_2 = 0.05) {
+fit_copulas_with_crash_matrix <- function(data_set, p_1 = 0.05, p_2 = 0.05, lookback=91) {
+  
+  data_set <- utils::tail(data_set, lookback)
   
   # Convert to pseudo-observations
   pseudo_obs <- data_set %>%
@@ -194,27 +135,112 @@ fit_copulas_with_crash_matrix <- function(data_set, p_1 = 0.05, p_2 = 0.05) {
     dplyr::select(ETF_1, ETF_2, Crash_Prob) %>%
     pivot_wider(names_from = ETF_2, values_from = Crash_Prob)
 
-  # Return all outputs as a named list
-  return(list(
-    results_table = copula_results_expanded,
-    best_copula_matrix = copula_matrix,
-    crash_probability_matrix = best_crash_matrix
-  ))
+  
+  return(crash_probability_matrix)
 }
 
-copula_outputs <- fit_copulas_with_crash_matrix(
-  data_set = last_quarter_returns,
-  p_1 = 0.05,
-  p_2 = 0.05
-)
-
-# Access outputs
-copula_outputs$results_table
-copula_outputs$best_copula_matrix
-copula_outputs$crash_probability_matrix
+measure_momentum <- function(data, lookback = NULL) {
+  
+  data <- utils::tail(data, lookback)
+  
+  arima_model <- forecast::auto.arima(data, d = 1, allowdrift = TRUE)  
+  coefs <- stats::coef(arima_model)
+  
+  drift <- ifelse("drift" %in% names(coefs), coefs["drift"], 0)
+  ar_terms <- sum(coefs[grep("ar", names(coefs))], na.rm = TRUE)
+  
+  
+  momentum_magnitude <- abs(drift) + abs(ar_terms)
+  
+  return(momentum_magnitude)
+}
 
 
 ```
+
+
+
+```{r dataCollect, echo=FALSE, warning=FALSE}
+
+## Portfolio Inputs
+tickers <- c("XLK",  # Technology
+             "XLV",  # Health Care
+             "XLF",  # Financials
+             "XLE",  # Energy
+             "XLI",  # Industrials
+             "XLU",  # Utilities
+             "XLY",  # Consumer Discretionary
+             "XLP",  # Consumer Staples
+             "XLB"  # Materials
+             )
+
+
+start_date <- "2022-10-01"
+end_date <- rollback(Sys.Date(), roll_to_first = FALSE)
+
+## Presentation Table
+present_table <- tibble::tibble(
+  Ticker = tickers
+)
+
+return_data <- fetch_return_data(tickers, start_date, end_date)
+
+```
+
+```{r CDF, echo=FALSE, warning=FALSE}
+# Filter returns to Q4 2022 period
+last_quarter_returns <- return_data #%>%
+  #filter(date >= as.Date("2022-10-01") & date <= as.Date("2022-12-31"))
+
+# Generate empirical CDF functions for each ETF
+empirical_cdfs <- last_quarter_returns %>%
+  dplyr::select(-date) %>%
+  map(~ ecdf(.x))  # Create an ECDF for each return series
+
+# Prepare data for CDF plotting: evaluate ECDF at each return
+cdf_plot_data <- last_quarter_returns %>%
+  dplyr::select(-date) %>%
+  pivot_longer(cols = everything(), names_to = "Ticker", values_to = "Return") %>%
+  rowwise() %>%
+  mutate(CDF = empirical_cdfs[[Ticker]](Return)) %>%
+  ungroup()
+
+# Plot empirical CDFs for each ETF
+ggplot(cdf_plot_data, aes(x = Return, y = CDF, color = Ticker)) +
+  geom_line(size = 1) +
+  labs(
+    title = "Empirical CDFs of ETF Daily Returns (Q4 2022)",
+    x = "Daily Return",
+    y = "Empirical Cumulative Probability"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+
+```
+
+```{r copula, echo=FALSE, warning=FALSE}
+
+copula_outputs <- return_data %>% 
+  dplyr::mutate(prob = purrr::map_dbl(c(XLK, XLV, XLF, XLE, XLI, XLU, XLY, XLP, XLB), ~fit_copulas_with_crash_matrix(.x, p_1 = 0.05, p_2 = 0.05, lookback = 20)))
+  
+copula_outputs
+
+
+```
+
+```{r momentum, echo=FALSE, warning=FALSE}
+
+momentum_ts <- return_data %>% 
+  tidyr::pivot_longer(cols = (tickers)) %>% 
+  dplyr::group_by(name)
+  dplyr::mutate(momentum = purrr::map_dbl(value, ~measure_momentum(.x, lookback = 20)))
+
+
+momentum_ts
+
+```
+
 
 ```{r backTest, echo=FALSE, warning=FALSE}
 
