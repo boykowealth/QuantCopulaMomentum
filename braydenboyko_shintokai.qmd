@@ -31,6 +31,8 @@ library(tibble)
 library(forecast)
 library(tseries)
 library(stats)
+library(KFAS)
+library(quantmod)
 
 fetch_return_data <- function(tickers, start_date, end_date) {
   data <- tq_get(tickers, from = start_date, to = end_date, get = "stock.prices")
@@ -38,7 +40,7 @@ fetch_return_data <- function(tickers, start_date, end_date) {
   daily_returns <- data %>%
     arrange(symbol, date) %>%
     group_by(symbol) %>%
-    mutate(daily_return = (adjusted - lag(adjusted)) / lag(adjusted)) %>%
+    mutate(daily_return = (adjusted - dplyr::lag(adjusted)) / dplyr::lag(adjusted)) %>%
     ungroup() %>%  
     dplyr::select(date, symbol, daily_return) %>%
     pivot_wider(names_from = symbol, values_from = daily_return) %>%
@@ -141,19 +143,32 @@ fit_copulas_with_crash_matrix <- function(data_set, p_1 = 0.05, p_2 = 0.05, look
 
 measure_momentum <- function(data, lookback = NULL) {
   
-  data <- utils::tail(data, lookback)
+  df <- dplyr::mutate(data, log = log(1 + value)) ## CALCULATE LOG RETURNS
   
-  arima_model <- forecast::auto.arima(data, d = 1, allowdrift = TRUE)  
-  coefs <- stats::coef(arima_model)
+  momentum_values <- numeric(nrow(df))
   
-  drift <- ifelse("drift" %in% names(coefs), coefs["drift"], 0)
-  ar_terms <- sum(coefs[grep("ar", names(coefs))], na.rm = TRUE)
+  for (i in seq_len(nrow(df))) {
+    if (i >= lookback) {
+      subset_df <- df[(i - lookback + 1):i, ]
+      
+      ## KALMAN FILTER MODEL
+      model <- KFAS::SSModel(subset_df$log ~ SSMtrend(degree = 1, Q = NA), H = NA)
+      fit <- KFAS::fitSSM(model, inits = c(var(subset_df$log, na.rm = TRUE), var(subset_df$log, na.rm = TRUE)), method = "BFGS") ## Broyden–Fletcher–Goldfarb–Shanno
+      kf <- KFAS::KFS(fit$model, filtering = "state", smoothing = "state")
+      
+      ## GET THE KALMAN MOMENTUM VALUE
+      kalman_momentum <- kf$a[, 1]
+      momentum_values[i] <- tail(kalman_momentum, 1)
+    } else {
+      momentum_values[i] <- NA 
+    }
+  }
   
-  
-  momentum_magnitude <- abs(drift) + abs(ar_terms)
-  
-  return(momentum_magnitude)
+  df <- dplyr::mutate(df, momentum = momentum_values)
+  return(df)
 }
+
+
 
 
 ```
@@ -231,12 +246,54 @@ copula_outputs
 
 ```{r momentum, echo=FALSE, warning=FALSE}
 
-momentum_ts <- return_data %>% 
-  tidyr::pivot_longer(cols = (tickers)) %>% 
-  dplyr::group_by(name)
-  dplyr::mutate(momentum = purrr::map_dbl(value, ~measure_momentum(.x, lookback = 20)))
+momentum_ts <- return_data %>%
+  tidyr::pivot_longer(cols = tickers, names_to = "name", values_to = "value") %>%
+  dplyr::group_by(name) %>%
+  dplyr::group_split() %>%
+  purrr::map_dfr(~ {
+    tryCatch({
+      dplyr::tibble(
+        name = unique(.x$name),
+        date = .x$date,
+        momentum = measure_momentum(.x, lookback = 20)$momentum
+      )
+    }, error = function(e) {
+      dplyr::tibble(name = unique(.x$name), date = NA, momentum = NA)
+    })
+  }) %>% 
+  dplyr::filter(!is.na(momentum))
 
+fitOU_results <- momentum_ts %>%
+  dplyr::group_by(name) %>%
+  dplyr::group_split() %>%
+  purrr::map(~ {
+    tryCatch({
+      RTL::fitOU(.x$momentum)
+    }, error = function(e) {
+    })
+  })
 
+chart <- momentum_ts %>%
+  dplyr::filter(name == "XLB") %>%
+  ggplot2::ggplot(aes(x = date, y = momentum, color = name, group = name)) + # Remove the extra comma
+  geom_line() +  # Line plot for momentum over time
+  geom_point() + # Add points for each date
+  labs(
+    title = "Momentum Over Time by Name",
+    x = "Date",
+    y = "Momentum",
+    color = "Name"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    legend.position = "bottom"
+  )
+
+plotly::ggplotly(chart)
+
+chart
+fitOU_results
 momentum_ts
 
 ```
