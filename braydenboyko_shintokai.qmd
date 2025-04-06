@@ -342,8 +342,8 @@ tickers <- c("XLK",  # Technology
              "XLB"  # Materials
              )
 
-start_date <- "2022-10-01"
-end_date <- rollback(Sys.Date(), roll_to_first = FALSE)
+start_date <- "2020-01-01"
+end_date <- rollback(Sys.Date(), roll_to_first = FALSE) ## MAKE SURE WE DONT INCLUDE BACKTEST PERIOD IN MODEL FIT (ONLY PRIOR)
 
 return_data <- fetch_return_data(tickers, start_date, end_date)
 
@@ -387,7 +387,7 @@ vol.wide <- vol %>%
 
 ```{r copula, echo=FALSE, warning=FALSE}
 
-copula_outputs <- analyzeRollingCopulas(vol.wide, 90, 0.05, 0.05) %>% 
+copula_outputs <- analyzeRollingCopulas(vol.wide, 91, 0.05, 0.05) %>% 
   dplyr::mutate(ETF = paste0(ETF_1, "_", ETF_2)) %>% 
   dplyr::select(date, ETF, BestCopula, CrashProbability)
 
@@ -408,7 +408,7 @@ momentum_ts <- spreads %>%
       dplyr::tibble(
         name = unique(.x$name),
         date = .x$date,
-        momentum = measure_momentum(.x, lookback = 20)$momentum
+        momentum = measure_momentum(.x, lookback = 30)$momentum
       )
     }, error = function(e) {
       dplyr::tibble(name = unique(.x$name), date = NA, momentum = NA)
@@ -554,11 +554,12 @@ modelRun <- transactData %>%
                 L2 = ifelse(M1 >= spread, 1, -1 ), ## BOTTOM SPREAD SIGNAL (BUY / SELL)
                 W1 = (1 / rVol1) * L1,
                 W2 = (1 / rVol2) * L2,
-                W1 = ifelse(L1 == -1, W1 / (abs(W1) + abs(W2)), 1 - (W2 / (abs(W1) + abs(W2)))),
-                W2 = 1 - W1
+                W1 = ifelse(L1 == -1, W1 / (abs(W1) + abs(W2)), 1 - (W2 / (abs(W1) + abs(W2)))), ## WEIGHT POS 1
+                W2 = 1 - W1 ## WEIGHT POS 2
                   )
-  
-modelRun
+
+transactions <- modelRun %>% 
+  dplyr::select(date, POS1, POS2, name, price1, price2, W1, W2) ## To Be Passed To Into BackTest
 
 ```
 
