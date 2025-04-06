@@ -14,6 +14,170 @@ editor: source
 <style type="text/css"> body, td {font-size: 12px;} code.r{font-size: 10px;} pre {font-size: 10px} </style>
 ```
 
+```{Rcpp copula, echo=FALSE, warning=FALSE}
+#include <Rcpp.h>
+#include <vector>
+#include <string>
+#include <algorithm>
+#include <numeric>
+#include <cmath>
+#include <limits>
+
+// Structure to represent a copula model
+struct Copula {
+    std::string name;       // Copula type (e.g., "gaussian", "t", etc.)
+    double parameter;       // Copula parameter (e.g., correlation for Gaussian)
+    double aic;             // Akaike Information Criterion (AIC)
+    double crashProbability;// Joint crash probability
+};
+
+// Function to compute the log-likelihood of a Gaussian copula
+double computeGaussianLogLikelihood(const std::vector<double>& u, const std::vector<double>& v, double correlation) {
+    double logLikelihood = 0.0;
+    size_t n = u.size();
+    double rho = correlation;
+
+    for (size_t i = 0; i < n; ++i) {
+        double z_u = R::qnorm(u[i], 0.0, 1.0, 1, 0); // Quantile function of the normal distribution
+        double z_v = R::qnorm(v[i], 0.0, 1.0, 1, 0);
+        double numerator = z_u * z_v * rho;
+        double denominator = std::sqrt(1 - rho * rho);
+        logLikelihood += -0.5 * std::log(1 - rho * rho) - numerator / denominator;
+    }
+    return logLikelihood;
+}
+
+// Function to fit a copula and calculate AIC
+Copula fitCopula(const std::vector<double>& u, const std::vector<double>& v, const std::string& copulaType, double p1, double p2) {
+    Copula copula;
+    copula.name = copulaType;
+
+    if (copulaType == "gaussian") {
+        double mean_u = std::accumulate(u.begin(), u.end(), 0.0) / u.size();
+        double mean_v = std::accumulate(v.begin(), v.end(), 0.0) / v.size();
+        double numerator = 0.0, denominator_u = 0.0, denominator_v = 0.0;
+        for (size_t i = 0; i < u.size(); ++i) {
+            numerator += (u[i] - mean_u) * (v[i] - mean_v);
+            denominator_u += std::pow(u[i] - mean_u, 2);
+            denominator_v += std::pow(v[i] - mean_v, 2);
+        }
+        copula.parameter = numerator / std::sqrt(denominator_u * denominator_v);
+        double logLikelihood = computeGaussianLogLikelihood(u, v, copula.parameter);
+        copula.aic = -2 * logLikelihood + 2; // AIC calculation
+        copula.crashProbability = R::pnorm(p1, 0.0, 1.0, 1, 0) * R::pnorm(p2, 0.0, 1.0, 1, 0) * copula.parameter;
+    } else if (copulaType == "t") {
+        copula.parameter = 0.4; // Placeholder parameter for t-Copula
+        copula.aic = 95.0;      // Example AIC
+        copula.crashProbability = p1 * p2 * (1 - copula.parameter);
+    } else if (copulaType == "clayton") {
+        copula.parameter = 1.0; // Placeholder parameter for Clayton
+        copula.aic = 110.0;
+        copula.crashProbability = p1 * p2 / (1 + copula.parameter);
+    } else if (copulaType == "gumbel") {
+        copula.parameter = 2.0; // Placeholder parameter for Gumbel
+        copula.aic = 105.0;
+        copula.crashProbability = std::pow(p1 * p2, 1.0 / copula.parameter);
+    } else if (copulaType == "frank") {
+        copula.parameter = 5.0; // Placeholder parameter for Frank
+        copula.aic = 108.0;
+        copula.crashProbability = -std::log(1 - std::exp(-copula.parameter) * (1 - p1) * (1 - p2));
+    }
+
+    return copula;
+}
+
+// [[Rcpp::export]]
+Rcpp::DataFrame analyzeRollingCopulas(
+    Rcpp::DataFrame data_set,
+    int lookback,
+    double p1,
+    double p2
+) {
+    Rcpp::StringVector dates = data_set["date"];
+    Rcpp::CharacterVector col_names = data_set.names();
+    Rcpp::NumericMatrix numeric_data(data_set.nrow(), data_set.size() - 1);
+
+    for (int col = 1; col < data_set.size(); ++col) {
+        Rcpp::NumericVector column = Rcpp::as<Rcpp::NumericVector>(data_set[col]);
+        for (int row = 0; row < data_set.nrow(); ++row) {
+            numeric_data(row, col - 1) = column[row];
+        }
+    }
+
+    std::vector<std::string> result_dates;
+    std::vector<std::string> etf1, etf2, bestCopulas;
+    std::vector<double> minCrashProbabilities;
+
+    int total_rows = numeric_data.nrow();
+
+    for (int current_index = lookback; current_index < total_rows; ++current_index) {
+        int start_index = current_index - lookback;
+        Rcpp::NumericMatrix window_data = numeric_data(Rcpp::Range(start_index, current_index - 1), Rcpp::_);
+
+        Rcpp::NumericMatrix pseudo_obs(window_data.nrow(), window_data.ncol());
+        for (int col = 0; col < window_data.ncol(); ++col) {
+            std::vector<double> column(window_data.nrow());
+            for (int row = 0; row < window_data.nrow(); ++row) {
+                column[row] = window_data(row, col);
+            }
+            std::vector<int> ranks(window_data.nrow());
+            std::iota(ranks.begin(), ranks.end(), 0);
+            std::sort(ranks.begin(), ranks.end(), [&column](int i, int j) { return column[i] < column[j]; });
+            for (int row = 0; row < window_data.nrow(); ++row) {
+                pseudo_obs(row, col) = (ranks[row] + 1.0) / (window_data.nrow() + 1.0);
+            }
+        }
+
+        std::string best_etf1, best_etf2, best_copula;
+        double min_crash_prob = std::numeric_limits<double>::max();
+
+        for (int i = 0; i < pseudo_obs.ncol(); ++i) {
+            for (int j = i + 1; j < pseudo_obs.ncol(); ++j) {
+                std::vector<double> u(pseudo_obs.nrow()), v(pseudo_obs.nrow());
+                for (int k = 0; k < pseudo_obs.nrow(); ++k) {
+                    u[k] = pseudo_obs(k, i);
+                    v[k] = pseudo_obs(k, j);
+                }
+
+                std::vector<std::string> copulaTypes = {"gaussian", "t", "clayton", "gumbel", "frank"};
+                Copula best_model;
+                best_model.aic = std::numeric_limits<double>::max();
+
+                for (const auto& copulaType : copulaTypes) {
+                    Copula copula = fitCopula(u, v, copulaType, p1, p2);
+                    if (copula.aic < best_model.aic) {
+                        best_model = copula;
+                    }
+                }
+
+                if (best_model.crashProbability < min_crash_prob) {
+                    min_crash_prob = best_model.crashProbability;
+                    best_etf1 = std::string(col_names[i + 1]);
+                    best_etf2 = std::string(col_names[j + 1]);
+                    best_copula = best_model.name;
+                }
+            }
+        }
+
+        result_dates.push_back(std::string(dates[current_index]));
+        etf1.push_back(best_etf1);
+        etf2.push_back(best_etf2);
+        bestCopulas.push_back(best_copula);
+        minCrashProbabilities.push_back(min_crash_prob);
+    }
+
+    return Rcpp::DataFrame::create(
+        Rcpp::Named("date") = result_dates,
+        Rcpp::Named("ETF_1") = etf1,
+        Rcpp::Named("ETF_2") = etf2,
+        Rcpp::Named("BestCopula") = bestCopulas,
+        Rcpp::Named("CrashProbability") = minCrashProbabilities
+    );
+}
+
+
+```
+
 ```{r functions, echo=FALSE, warning=FALSE}
 
 library(tidyverse)
@@ -33,117 +197,101 @@ library(tseries)
 library(stats)
 library(KFAS)
 library(quantmod)
+library(Rcpp)
+library(zoo)
 
 fetch_return_data <- function(tickers, start_date, end_date) {
   data <- tq_get(tickers, from = start_date, to = end_date, get = "stock.prices")
   
   daily_returns <- data %>%
-    arrange(symbol, date) %>%
-    group_by(symbol) %>%
-    mutate(daily_return = (adjusted - dplyr::lag(adjusted)) / dplyr::lag(adjusted)) %>%
-    ungroup() %>%  
+    dplyr::arrange(symbol, date) %>%
+    dplyr::group_by(symbol) %>%
+    dplyr::mutate(daily_return = (adjusted - dplyr::lag(adjusted)) / dplyr::lag(adjusted)) %>%
+    dplyr::ungroup() %>%  
     dplyr::select(date, symbol, daily_return) %>%
-    pivot_wider(names_from = symbol, values_from = daily_return) %>%
-    relocate(date) %>%
-    drop_na()
+    tidyr::pivot_wider(names_from = symbol, values_from = daily_return) %>%
+    dplyr::relocate(date) %>%
+    tidyr::drop_na()
   
   return(daily_returns)
 }
 
-fit_copulas_with_crash_matrix <- function(data_set, p_1 = 0.05, p_2 = 0.05, lookback=91) {
-  
-  data_set <- utils::tail(data_set, lookback)
-  
-  # Convert to pseudo-observations
-  pseudo_obs <- data_set %>%
-    dplyr::select(where(is.numeric)) %>%
-    map_df(~ rank(.x) / (length(.x) + 1))
-
-  # Generate ETF pairs
-  etf_pairs <- combn(names(pseudo_obs), 2, simplify = FALSE)
-
-  # Fit copulas and compute AICs + joint crash probabilities
-  fit_copulas_for_pair <- function(u, v) {
-    copula_families <- list(
-      gaussian = normalCopula(0.5, dim = 2),
-      t        = tCopula(0.5, dim = 2, df = 4L),
-      clayton  = claytonCopula(1, dim = 2),
-      gumbel   = gumbelCopula(2, dim = 2),
-      frank    = frankCopula(5, dim = 2)
-    )
-    
-    aic_scores <- list()
-    crash_probs <- list()
-    
-    for (cop_name in names(copula_families)) {
-      cop <- copula_families[[cop_name]]
-      fit <- try(fitCopula(cop, cbind(u, v), method = "ml"), silent = TRUE)
-      
-      if (!inherits(fit, "try-error")) {
-        fitted_cop <- fit@copula
-        if (cop_name == "t") {
-          rho <- coef(fit)[1]
-          df  <- as.integer(round(coef(fit)["df"]))
-          fitted_cop <- tCopula(rho, dim = 2, df = df, dispstr = "un")
-        }
-        
-        aic_scores[[cop_name]] <- AIC(fit)
-        crash_probs[[cop_name]] <- pCopula(c(p_1, p_2), fitted_cop)
-      }
-    }
-    
-    list(aic = aic_scores, crash = crash_probs)
-  }
-
-  # Fit all pairs
-  copula_results <- map_dfr(etf_pairs, function(pair) {
-    u <- pseudo_obs[[pair[1]]]
-    v <- pseudo_obs[[pair[2]]]
-    result <- fit_copulas_for_pair(u, v)
-    
-    tibble(
-      ETF_1 = pair[1],
-      ETF_2 = pair[2],
-      BestCopula = if (length(result$aic) > 0) names(which.min(result$aic)) else NA,
-      AICs = list(result$aic),
-      CrashProbs = list(result$crash)
-    )
-  })
-
-  # Expand AIC and Crash Probabilities
-  copula_results_expanded <- copula_results %>%
-    unnest_wider(AICs, names_sep = "_aic_") %>%
-    unnest_wider(CrashProbs, names_sep = "_crash_")
-
-  # Matrix of Best Copulas
-  copula_matrix <- copula_results %>%
-    dplyr::select(ETF_1, ETF_2, BestCopula) %>%
-    pivot_wider(names_from = ETF_2, values_from = BestCopula)
-
-  # Matrix of Crash Probabilities using best copula
-  best_crash_matrix <- copula_results_expanded %>%
-    rowwise() %>%
-    mutate(
-      Crash_Prob = case_when(
-        BestCopula == "gaussian" ~ CrashProbs_crash_gaussian,
-        BestCopula == "t"        ~ CrashProbs_crash_t,
-        BestCopula == "clayton"  ~ CrashProbs_crash_clayton,
-        BestCopula == "gumbel"   ~ CrashProbs_crash_gumbel,
-        BestCopula == "frank"    ~ CrashProbs_crash_frank,
-        TRUE ~ NA_real_
-      )
-    ) %>%
-    ungroup() %>%
-    dplyr::select(ETF_1, ETF_2, Crash_Prob) %>%
-    pivot_wider(names_from = ETF_2, values_from = Crash_Prob)
-
-  
-  return(crash_probability_matrix)
-}
+# analyze_rolling_copulas <- function(data_set, start_date , lookback , p_1 , p_2 ) {
+#   # Sort data
+#   data_set <- data_set %>% arrange(date)
+# 
+#   # Create a list of daily analysis dates starting from the given start date
+#   analysis_dates <- data_set %>%
+#     pull(date) %>%
+#     sort() %>%
+#     .[. >= start_date]
+# 
+#   # Define list of copula models to test
+#   copula_types <- list(
+#     gaussian = normalCopula(0.5, dim = 2),
+#     t        = tCopula(0.5, dim = 2, df = 4L),
+#     clayton  = claytonCopula(1, dim = 2),
+#     gumbel   = gumbelCopula(2, dim = 2),
+#     frank    = frankCopula(5, dim = 2)
+#   )
+# 
+#   # Loop through each analysis date and compute the lowest ETF pair probability
+#   purrr::map_dfr(analysis_dates, function(current_date) {
+#     message("Running copula analysis for: ", current_date) # we dont need this line just so that we know how slow the model is....
+# 
+#     # Subset rolling window of 'lookback' days ending on current_date
+#     window_data <- data_set %>%
+#       filter(date <= current_date) %>%
+#       tail(lookback)
+# 
+#     # Convert data to pseudo-observations (ranks)
+#     pseudo_obs <- window_data %>%
+#       dplyr::select(-date) %>%
+#       map_df(~ rank(.x) / (length(.x) + 1))
+# 
+#     # Create all ETF pair combinations
+#     etf_pairs <- combn(names(pseudo_obs), 2, simplify = FALSE)
+# 
+#     # For each ETF pair, fit all copulas and pick the best (by AIC)
+#     daily_results <- purrr::map_dfr(etf_pairs, function(pair) {
+#       u <- pseudo_obs[[pair[1]]]
+#       v <- pseudo_obs[[pair[2]]]
+# 
+#       map_dfr(names(copula_types), function(cop_name) {
+#         cop_model <- copula_types[[cop_name]]
+#         fit <- try(fitCopula(cop_model, cbind(u, v), method = "ml"), silent = TRUE)
+# 
+#         # If t-Copula, rebuild using estimated parameters
+#         fitted_model <- if (cop_name == "t") {
+#           est <- coef(fit)
+#           tCopula(param = est[1], dim = 2, df = round(est["df"]), dispstr = "un")
+#         } else {
+#           slot(fit, "copula")
+#         }
+# 
+#         # Return AIC and joint crash probability
+#         tibble(
+#           ETF_1 = pair[1],
+#           ETF_2 = pair[2],
+#           Copula = cop_name,
+#           AIC = AIC(fit),
+#           CrashProb = pCopula(c(p_1, p_2), fitted_model)
+#         )
+#       }) %>%
+#         filter(AIC == min(AIC, na.rm = TRUE))  # Best copula for the pair
+#     })
+# 
+#     # Return the pair with the lowest joint crash probability for the day
+#     daily_results %>%
+#       filter(CrashProb == min(CrashProb, na.rm = TRUE))%>%
+#       mutate(Date = current_date) %>%
+#       dplyr::select(Date, ETF_1, ETF_2)
+#   })
+# }
 
 measure_momentum <- function(data, lookback = NULL) {
   
-  df <- dplyr::mutate(data, log = log(1 + value)) ## CALCULATE LOG RETURNS
+  df <- dplyr::mutate(data, log = log(1 + spread)) ## CALCULATE LOG RETURNS
   
   momentum_values <- numeric(nrow(df))
   
@@ -168,16 +316,21 @@ measure_momentum <- function(data, lookback = NULL) {
   return(df)
 }
 
-
+predict_ou <- function(current_value, theta, mu, sigma, dt = 1) {
+  
+  drift <- theta * (mu - current_value) * dt
+  diffusion <- sigma * sqrt(dt) * rnorm(1, mean = 0, sd = 1)
+  
+  next_value <- current_value + drift + diffusion
+  
+  return(next_value)
+}
 
 
 ```
 
-
-
 ```{r dataCollect, echo=FALSE, warning=FALSE}
 
-## Portfolio Inputs
 tickers <- c("XLK",  # Technology
              "XLV",  # Health Care
              "XLF",  # Financials
@@ -189,65 +342,65 @@ tickers <- c("XLK",  # Technology
              "XLB"  # Materials
              )
 
-
 start_date <- "2022-10-01"
 end_date <- rollback(Sys.Date(), roll_to_first = FALSE)
 
-## Presentation Table
-present_table <- tibble::tibble(
-  Ticker = tickers
-)
-
 return_data <- fetch_return_data(tickers, start_date, end_date)
 
-```
+spreads <- return_data %>%
+  tidyr::pivot_longer(-date, names_to = "ETF", values_to = "return") %>%
+  dplyr::inner_join(return_data %>% tidyr::pivot_longer(-date, names_to = "ETF2", values_to = "return2"),by = "date") %>%
+  dplyr::filter(ETF < ETF2) %>%
+  dplyr::mutate(
+    spread = return - return2,
+    name = paste0(ETF, "_", ETF2)
+  ) %>%
+  dplyr::select(date, name, spread)
 
-```{r CDF, echo=FALSE, warning=FALSE}
-# Filter returns to Q4 2022 period
-last_quarter_returns <- return_data #%>%
-  #filter(date >= as.Date("2022-10-01") & date <= as.Date("2022-12-31"))
+spreads.wide <- spreads %>% 
+  tidyr::pivot_wider(names_from = name, values_from = spread)
 
-# Generate empirical CDF functions for each ETF
-empirical_cdfs <- last_quarter_returns %>%
-  dplyr::select(-date) %>%
-  map(~ ecdf(.x))  # Create an ECDF for each return series
-
-# Prepare data for CDF plotting: evaluate ECDF at each return
-cdf_plot_data <- last_quarter_returns %>%
-  dplyr::select(-date) %>%
-  pivot_longer(cols = everything(), names_to = "Ticker", values_to = "Return") %>%
-  rowwise() %>%
-  mutate(CDF = empirical_cdfs[[Ticker]](Return)) %>%
+vol <- return_data %>%
+  tidyr::pivot_longer(-date, names_to = "ETF", values_to = "return") %>%
+  dplyr::group_by(ETF) %>%
+  dplyr::arrange(date, .by_group = TRUE) %>%
+  dplyr::mutate(
+    rollingVol = rollapply(
+                    return,
+                    width = 30,
+                    FUN = sd,
+                    align = "right",
+                    fill = NA
+                    ),
+    chgVol = rollingVol - dplyr::lag(rollingVol)
+  ) %>%
   ungroup()
 
-# Plot empirical CDFs for each ETF
-ggplot(cdf_plot_data, aes(x = Return, y = CDF, color = Ticker)) +
-  geom_line(size = 1) +
-  labs(
-    title = "Empirical CDFs of ETF Daily Returns (Q4 2022)",
-    x = "Daily Return",
-    y = "Empirical Cumulative Probability"
-  ) +
-  theme_minimal() +
-  theme(legend.position = "bottom")
+vol.wide <- vol %>% 
+  dplyr::select(date, ETF, chgVol) %>% 
+  tidyr::drop_na() %>% 
+  tidyr::pivot_wider(names_from = ETF, values_from = chgVol)
 
 
 ```
+
 
 ```{r copula, echo=FALSE, warning=FALSE}
 
-copula_outputs <- return_data %>% 
-  dplyr::mutate(prob = purrr::map_dbl(c(XLK, XLV, XLF, XLE, XLI, XLU, XLY, XLP, XLB), ~fit_copulas_with_crash_matrix(.x, p_1 = 0.05, p_2 = 0.05, lookback = 20)))
-  
-copula_outputs
+copula_outputs <- analyzeRollingCopulas(vol.wide, 90, 0.05, 0.05) %>% 
+  dplyr::mutate(ETF = paste0(ETF_1, "_", ETF_2)) %>% 
+  dplyr::select(date, ETF, BestCopula, CrashProbability)
 
+
+positions <- copula_outputs %>% ## Provides DF Of HoldingS (Spread) On Each Date
+  dplyr::select(date, ETF) %>% 
+  dplyr::mutate(date = zoo::as.Date(date))
 
 ```
 
 ```{r momentum, echo=FALSE, warning=FALSE}
 
-momentum_ts <- return_data %>%
-  tidyr::pivot_longer(cols = tickers, names_to = "name", values_to = "value") %>%
+momentum_ts <- spreads %>%
   dplyr::group_by(name) %>%
   dplyr::group_split() %>%
   purrr::map_dfr(~ {
@@ -266,18 +419,39 @@ momentum_ts <- return_data %>%
 fitOU_results <- momentum_ts %>%
   dplyr::group_by(name) %>%
   dplyr::group_split() %>%
-  purrr::map(~ {
+  purrr::map_dfr(~ {
     tryCatch({
-      RTL::fitOU(.x$momentum)
+      result <- RTL::fitOU(.x$momentum)
+      
+      dplyr::tibble(
+        name = unique(.x$name),
+        theta = result$theta,
+        mu = result$mu,
+        sigma = result$sigma
+      )
     }, error = function(e) {
+      # Return NA values in case of an error
+      dplyr::tibble(
+        name = unique(.x$name),
+        theta = NA, 
+        mu = NA, 
+        sigma = NA
+      )
     })
   })
 
+
+```
+
+
+```{r research, echo=FALSE, warning=FALSE}
+#| output: FALSE
+
 chart <- momentum_ts %>%
-  dplyr::filter(name == "XLB") %>%
-  ggplot2::ggplot(aes(x = date, y = momentum, color = name, group = name)) + # Remove the extra comma
-  geom_line() +  # Line plot for momentum over time
-  geom_point() + # Add points for each date
+  dplyr::filter(name == "XLB_XLE") %>% 
+  ggplot2::ggplot(aes(x = date, y = momentum, color = name, group = name)) +
+  geom_line() +  
+  geom_point() + 
   labs(
     title = "Momentum Over Time by Name",
     x = "Date",
@@ -290,20 +464,81 @@ chart <- momentum_ts %>%
     legend.position = "bottom"
   )
 
-plotly::ggplotly(chart)
+p1 <- plotly::ggplotly(chart)
 
-chart
-fitOU_results
-momentum_ts
+data <- tq_get(tickers, from = start_date, to = end_date, get = "stock.prices") %>%
+  dplyr::select(date, symbol, adjusted)
 
+chart1 <- data %>%
+  dplyr::filter(symbol == c("XLE", "XLB")) %>% 
+  ggplot2::ggplot(aes(x = date, y = adjusted, color = symbol, group = symbol)) +
+  geom_line() +  
+  geom_point() + 
+  labs(
+    title = "Prices Over Time by Name",
+    x = "Date",
+    y = "Prices",
+    color = "Name"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    legend.position = "bottom"
+  )
+
+p2 <- plotly::ggplotly(chart1)
+
+
+chart2 <- spreads %>%
+  dplyr::filter(name == "XLB_XLE") %>% 
+  ggplot2::ggplot(aes(x = date, y = spread, color = name, group = name)) +
+  geom_line() +  
+  geom_point() + 
+  labs(
+    title = "Prices Over Time by Name",
+    x = "Date",
+    y = "Prices",
+    color = "Name"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    legend.position = "bottom"
+  )
+
+p3 <- plotly::ggplotly(chart2)
+
+plotly::subplot(p1, p2, p3,nrows = 3, shareX = T)
 ```
 
 
-```{r backTest, echo=FALSE, warning=FALSE}
 
+```{r compile, echo=FALSE, warning=FALSE}
 
+signalData <- spreads %>% 
+  dplyr::left_join(fitOU_results, by="name")
+
+transactData <- data %>% 
+  dplyr::left_join(vol, by=c("date"="date", "symbol"="ETF")) %>% 
+  dplyr::left_join(positions, by="date") %>% 
+  dplyr::mutate(name = ETF) %>% 
+    tidyr::separate(
+    col = ETF,
+    into = c("POS1", "POS2"),
+    sep = "_"
+  ) %>% 
+  dplyr::filter((symbol == POS1) | (symbol == POS2)) %>% 
+  dplyr::arrange(date) %>% 
+  dplyr::left_join(signalData, by=c("name", "date"))
+
+#transactData
 
 ```
+
+```{r model, echo=FALSE, warning=FALSE}
+
+```
+
 
 The CopulaMomentum strategy...
 
