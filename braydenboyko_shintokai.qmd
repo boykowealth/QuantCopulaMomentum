@@ -537,6 +537,29 @@ transactData <- data %>%
 
 ```{r model, echo=FALSE, warning=FALSE}
 
+modelRun <- transactData %>% 
+  dplyr::mutate(price1 = adjusted,
+          price2 = dplyr::lead(adjusted),
+          ret1 = return,
+          ret2 = dplyr::lead(return),
+          rVol1 = rollingVol,
+          rVol2 = dplyr::lead(rollingVol),
+          cVol1 = chgVol,
+          cVol2 = dplyr::lead(chgVol)
+          ) %>% 
+  dplyr::distinct(date, .keep_all = TRUE) %>% 
+  dplyr::select(date, POS1, POS2, name, spread, theta, mu, sigma, price1, price2, ret1, ret2, rVol1, rVol2, cVol1, cVol2) %>% 
+  dplyr::mutate(M1 = predict_ou(current_value = spread, theta = theta, mu = mu, sigma = sigma), ## MOMEMNTUM SIGNAL
+                L1 = ifelse(M1 >= spread, -1, 1), ## TOP SPREAD SIGNAL (BUY / SELL)
+                L2 = ifelse(M1 >= spread, 1, -1 ), ## BOTTOM SPREAD SIGNAL (BUY / SELL)
+                W1 = (1 / rVol1) * L1,
+                W2 = (1 / rVol2) * L2,
+                W1 = ifelse(L1 == -1, W1 / (abs(W1) + abs(W2)), 1 - (W2 / (abs(W1) + abs(W2)))),
+                W2 = 1 - W1
+                  )
+  
+modelRun
+
 ```
 
 
