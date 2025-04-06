@@ -555,12 +555,24 @@ modelRun <- transactData %>%
                 W1 = (1 / rVol1) * L1,
                 W2 = (1 / rVol2) * L2,
                 W1 = ifelse(L1 == -1, W1 / (abs(W1) + abs(W2)), 1 - (W2 / (abs(W1) + abs(W2)))), ## WEIGHT POS 1
-                W2 = 1 - W1 ## WEIGHT POS 2
-                  )
+                W2 = 1 - W1, ## WEIGHT POS 2
+                Trades = ifelse(abs(M1) <= dplyr::lag(abs(M1)), 0, 1),
+                TradesClose = as.Date(round(252/theta) + date)
+                ) %>% 
+  tidyr::replace_na(list(Trades = 1))
 
-transactions <- modelRun %>% 
-  dplyr::select(date, POS1, POS2, name, price1, price2, W1, W2) ## To Be Passed To Into BackTest
+transactions_open <- modelRun %>% 
+  dplyr::select(date, POS1, POS2, name, price1, price2, W1, W2, Trades) %>%  ## To Be Passed To Into BackTest
+  dplyr::filter(Trades == 1) %>% 
+  dplyr::select(-Trades)
 
+transactions_close <- modelRun %>% 
+  dplyr::select(date, POS1, POS2, name, price1, price2, M1, W1, W2, Trades, TradesClose) %>%  ## To Be Passed To Into BackTest
+  dplyr::filter(Trades == 1) %>% 
+  dplyr::select(date, POS1, POS2, name, TradesClose)
+  
+transactions_open
+transactions_close
 ```
 
 
