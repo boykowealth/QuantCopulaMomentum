@@ -1,20 +1,379 @@
 ---
-title: "CopulaMomentum Quantitative Strategy Proposal"
+title: "Copula-Momentum Strategy: Quantitative Equity Trading"
 author: Brayden Boyko & Shinto Kai
 date: "`r Sys.Date()`"
 format: 
   html:
     toc: true
-    toc-location: left
+    toc-location: right
     embed-resources: true
 editor: source
 ---
 
 ```{=html}
-<style type="text/css"> body, td {font-size: 12px;} code.r{font-size: 10px;} pre {font-size: 10px} </style>
+<style type="text/css"> body, td {font-size: 14px;} code.r{font-size: 10px;} pre {font-size: 10px} </style>
 ```
 
-```{Rcpp copula, echo=FALSE, warning=FALSE}
+```{r functions, echo=FALSE, warning=FALSE, message=FALSE}
+
+library(tidyverse)
+library(rlang)
+library(purrr)
+library(lubridate)
+library(tidyquant)
+library(knitr)
+library(ggplot2)
+library(copula)
+library(fitdistrplus)
+library(VineCopula) 
+library(dplyr)
+library(tibble)
+library(forecast)
+library(tseries)
+library(stats)
+library(KFAS)
+library(quantmod)
+library(Rcpp)
+library(zoo)
+library(patchwork)
+library(viridis)
+library(PerformanceAnalytics)
+
+fetch_return_data <- function(tickers, start_date, end_date) {
+  data <- tq_get(tickers, from = start_date, to = end_date, get = "stock.prices")
+  
+  daily_returns <- data %>%
+    dplyr::arrange(symbol, date) %>%
+    dplyr::group_by(symbol) %>%
+    dplyr::mutate(daily_return = (adjusted - dplyr::lag(adjusted)) / dplyr::lag(adjusted)) %>%
+    dplyr::ungroup() %>%  
+    dplyr::select(date, symbol, daily_return) %>%
+    tidyr::pivot_wider(names_from = symbol, values_from = daily_return) %>%
+    dplyr::relocate(date) %>%
+    tidyr::drop_na()
+  
+  return(daily_returns)
+}
+
+# analyze_rolling_copulas <- function(data_set, start_date, lookback, p_1, p_2) {
+#   # Sort data
+#   data_set <- data_set %>% arrange(date)
+#   
+#   # Create a list of daily analysis dates starting from the given start date
+#   analysis_dates <- data_set %>%
+#     pull(date) %>%
+#     sort() %>%
+#     .[. >= start_date]
+#   
+#   # Define list of copula models to test
+#   copula_types <- list(
+#     gaussian = normalCopula(0.5, dim = 2),
+#     t        = tCopula(0.5, dim = 2, df = 4L),
+#     clayton  = claytonCopula(1, dim = 2),
+#     gumbel   = gumbelCopula(2, dim = 2),
+#     frank    = frankCopula(5, dim = 2)
+#   )
+#   
+#   # Loop through each analysis date and compute the lowest ETF pair probability
+#   purrr::map_dfr(analysis_dates, function(current_date) {
+#     # Subset rolling window of 'lookback' days ending on current_date
+#     window_data <- data_set %>%
+#       filter(date <= current_date) %>%
+#       tail(lookback)
+#     
+#     # Convert data to pseudo-observations (ranks)
+#     pseudo_obs <- window_data %>%
+#       dplyr::select(-date) %>%
+#       map_df(~ rank(.x) / (length(.x) + 1))
+#     
+#     # Create all ETF pair combinations
+#     etf_pairs <- combn(names(pseudo_obs), 2, simplify = FALSE)
+#     
+#     # For each ETF pair, fit all copulas and pick the best (by AIC)
+#     daily_results <- purrr::map_dfr(etf_pairs, function(pair) {
+#       u <- pseudo_obs[[pair[1]]]
+#       v <- pseudo_obs[[pair[2]]]
+#       
+#       map_dfr(names(copula_types), function(cop_name) {
+#         cop_model <- copula_types[[cop_name]]
+#         fit <- try(fitCopula(cop_model, cbind(u, v), method = "ml"), silent = TRUE)
+#         
+#         # Check if fit failed - if so, return NA values
+#         if (inherits(fit, "try-error")) {
+#           return(tibble(
+#             ETF_1 = pair[1],
+#             ETF_2 = pair[2],
+#             Copula = cop_name,
+#             AIC = NA_real_,
+#             CrashProb = NA_real_
+#           ))
+#         }
+#         
+#         # Only proceed with valid fits
+#         tryCatch({
+#           # If t-Copula, rebuild using estimated parameters
+#           fitted_model <- if (cop_name == "t") {
+#             est <- coef(fit)
+#             tCopula(param = est[1], dim = 2, df = round(est["df"]), dispstr = "un")
+#           } else {
+#             slot(fit, "copula")
+#           }
+#           
+#           # Return AIC and joint crash probability
+#           tibble(
+#             ETF_1 = pair[1],
+#             ETF_2 = pair[2],
+#             Copula = cop_name,
+#             AIC = AIC(fit),
+#             CrashProb = pCopula(c(p_1, p_2), fitted_model)
+#           )
+#         }, error = function(e) {
+#           # In case of any other errors during model evaluation
+#           tibble(
+#             ETF_1 = pair[1],
+#             ETF_2 = pair[2],
+#             Copula = cop_name,
+#             AIC = NA_real_,
+#             CrashProb = NA_real_
+#           )
+#         })
+#       }) %>%
+#         filter(!is.na(AIC)) %>%  # First filter out NA values
+#         filter(n() > 0) %>%      # Ensure we have at least one valid model
+#         filter(AIC == min(AIC))  # Best copula for the pair
+#     })
+#     
+#     # Return the pair with the lowest joint crash probability for the day
+#     result <- daily_results %>%
+#       filter(!is.na(CrashProb)) %>%  # Filter out NA values
+#       filter(n() > 0)               # Ensure we have at least one valid result
+#     
+#     # Only find minimum if we have valid results
+#     if (nrow(result) > 0) {
+#       result <- result %>%
+#         filter(CrashProb == min(CrashProb)) %>%
+#         mutate(Date = current_date) %>%
+#         dplyr::select(Date, ETF_1, ETF_2, Copula, CrashProb)
+#     } else {
+#       # Return NA row if no valid results for this date
+#       result <- tibble(
+#         Date = current_date,
+#         ETF_1 = NA_character_,
+#         ETF_2 = NA_character_,
+#         Copula = NA_character_,
+#         CrashProb = NA_real_
+#       )
+#     }
+#     
+#     return(result)
+#   })
+# }
+
+measure_momentum <- function(data, lookback = NULL) {
+  
+  df <- dplyr::mutate(data, log = log(1 + spread)) ## CALCULATE LOG RETURNS
+  
+  momentum_values <- numeric(nrow(df))
+  
+  for (i in seq_len(nrow(df))) {
+    if (i >= lookback) {
+      subset_df <- df[(i - lookback + 1):i, ]
+      
+      ## KALMAN FILTER MODEL
+      model <- KFAS::SSModel(subset_df$log ~ SSMtrend(degree = 1, Q = NA), H = NA)                      ## Broyden–Fletcher–Goldfarb–Shanno
+      fit <- KFAS::fitSSM(model, inits = c(var(subset_df$log, na.rm = TRUE), var(subset_df$log, na.rm = TRUE)), method = "BFGS")
+      kf <- KFAS::KFS(fit$model, filtering = "state", smoothing = "state")
+      
+      ## GET THE KALMAN MOMENTUM VALUE
+      kalman_momentum <- kf$a[, 1]
+      momentum_values[i] <- utils::tail(kalman_momentum, 1)
+    } else {
+      momentum_values[i] <- NA 
+    }
+  }
+  
+  df <- dplyr::mutate(df, momentum = momentum_values)
+  return(df)
+}
+
+predict_ou <- function(current_value, theta, mu, sigma, dt = 1) {
+  
+  drift <- theta * (mu - current_value) * dt
+  diffusion <- sigma * sqrt(dt) * rnorm(1, mean = 0, sd = 1)
+  
+  next_value <- current_value + drift + diffusion
+  
+  return(next_value)
+}
+
+generate_trades_given_leverage <- function(L, transactData) {
+  
+  modelRun <- transactData %>% 
+    dplyr::mutate(
+      price1 = adjusted,
+      price2 = dplyr::lead(adjusted),
+      ret1 = return,
+      ret2 = dplyr::lead(return),
+      rVol1 = rollingVol,
+      rVol2 = dplyr::lead(rollingVol),
+      cVol1 = chgVol,
+      cVol2 = dplyr::lead(chgVol)
+    ) %>% 
+    dplyr::distinct(date, .keep_all = TRUE) %>% 
+    dplyr::select(date, POS1, POS2, name, spread, theta, mu, sigma, price1, price2, ret1, ret2, rVol1, rVol2, cVol1, cVol2) %>% 
+    dplyr::mutate(
+      M1 = predict_ou(current_value = spread, theta = theta, mu = mu, sigma = sigma), ## momentum signal
+      L1 = ifelse(M1 >= spread, -1, 1),  # top asset signal
+      L2 = ifelse(M1 >= spread, 1, -1),  # bottom asset signal
+
+      raw_W1 = (1 / rVol1) * L1,
+      raw_W2 = (1 / rVol2) * L2,
+
+      norm_factor = abs(raw_W1) + abs(raw_W2),   ## normalize weights
+      W1 = raw_W1 / norm_factor * L,
+      W2 = raw_W2 / norm_factor * L,
+
+      Trades = ifelse(abs(M1) <= dplyr::lag(abs(M1)), 0, 1),
+      TradesClose = as.Date(round(252/theta) + date)
+    ) %>% 
+    tidyr::replace_na(list(Trades = 1))
+
+  transactions_open <- modelRun %>% 
+    dplyr::select(date, POS1, POS2, name, price1, price2, W1, W2, Trades) %>%
+    dplyr::filter(Trades == 1) %>%
+    dplyr::select(-Trades)
+
+  transactions_close <- modelRun %>% 
+    dplyr::select(date, POS1, POS2, name, price1, price2, M1, W1, W2, Trades, TradesClose) %>%
+    dplyr::filter(Trades == 1) %>%
+    dplyr::select(date, POS1, POS2, name, W1, W2, TradesClose)
+
+  return(list(
+    transactions_open = transactions_open,
+    transactions_close = transactions_close
+  ))
+}
+
+compute_cost_adjusted_returns <- function(transactions_open, transactions_close, return_data, backtest_start = as.Date("2023-01-01")) {
+  
+  # --- Transaction Cost Table ---
+  etf_data <- dplyr::tibble(
+    ETF = c("XLK", "XLV", "XLF", "XLE", "XLI", "XLU", "XLY", "XLP", "XLB"),
+    Bid_Ask = c(0.00015, 0.0035, 0.00035, 0.00075, 0.00035, 0.00035, 0.00035, 0.0002, 0.00035),
+    Short_Sale_Cost = c(1.0, 1.25, 1.5, 1.5, 1.0, 0.75, 0.75, 0.75, 1.0)
+  )
+  
+  # --- Expand holding days ---
+  expanded_trades <- transactions_open %>%
+    left_join(transactions_close, by = c("date", "name", "POS1", "POS2")) %>%
+    rename(W1 = W1.x, W2 = W2.x) %>%
+    mutate(
+      holding_days = purrr::map2(date, TradesClose, ~ seq.Date(from = .x, to = .y, by = "day"))
+    ) %>%
+    tidyr::unnest(holding_days) %>%
+    rename(trade_date = date, date = holding_days)
+  
+  # --- Prepare returns in long format ---
+  returns_long <- return_data %>%
+    tidyr::pivot_longer(-date, names_to = "symbol", values_to = "ret")
+  
+  # --- Join costs + returns and calculate PnL ---
+  expanded_pnl <- expanded_trades %>%
+    left_join(etf_data, by = c("POS1" = "ETF")) %>%
+    rename(BidAsk1 = Bid_Ask, SSC1 = Short_Sale_Cost) %>%
+    left_join(etf_data, by = c("POS2" = "ETF")) %>%
+    rename(BidAsk2 = Bid_Ask, SSC2 = Short_Sale_Cost) %>%
+    left_join(returns_long, by = c("date", "POS1" = "symbol")) %>%
+    rename(ret1 = ret) %>%
+    left_join(returns_long, by = c("date", "POS2" = "symbol")) %>%
+    rename(ret2 = ret) %>%
+    mutate(
+      daily_ssc1 = ifelse(W1 < 0, abs(W1) * (SSC1 / 100) / 252, 0),
+      daily_ssc2 = ifelse(W2 < 0, abs(W2) * (SSC2 / 100) / 252, 0),
+      
+      bidask_adj1 = ifelse(W1 > 0, -BidAsk1, BidAsk1),
+      bidask_adj2 = ifelse(W2 > 0, -BidAsk2, BidAsk2),
+      
+      cost_adj1 = ret1 + bidask_adj1 - daily_ssc1,
+      cost_adj2 = ret2 + bidask_adj2 - daily_ssc2,
+      
+      pnl = W1 * cost_adj1 + W2 * cost_adj2
+    ) %>%
+    dplyr::select(date, name, pnl)
+  
+  # --- Daily PnL: average of all trades ---
+  daily_pnl <- expanded_pnl %>%
+    group_by(date) %>%
+    summarise(
+      pnl = sum(pnl, na.rm = TRUE),
+      num_trades = n(),
+      .groups = "drop"
+    ) %>%
+    mutate(pnl = pnl / num_trades)
+  
+  # --- Create full date grid ---
+  full_dates_backtest <- tibble(date = seq.Date(
+    from = backtest_start,
+    to = max(daily_pnl$date),
+    by = "day"
+  ))
+  
+  # --- Merge and get cumulative return ---
+  pnl_full_backtest <- full_dates_backtest %>%
+    left_join(daily_pnl, by = "date") %>%
+    replace_na(list(pnl = 0)) %>%
+    arrange(date) %>%
+    mutate(cum_return = cumprod(1 + pnl))
+  
+  return(list(
+    daily_returns = pnl_full_backtest,
+    expanded_pnl = expanded_pnl
+  ))
+}
+
+costSensitivity <- function(sens, ssc_values, transaction_costs) {
+  sens_agg <- sens %>%
+    dplyr::group_by(name) %>%
+    dplyr::summarize(
+      W1 = mean(W1, na.rm = TRUE),
+      W2 = mean(W2, na.rm = TRUE),
+      ret1 = mean(ret1, na.rm = TRUE),
+      ret2 = mean(ret2, na.rm = TRUE),
+      BidAsk1 = mean(BidAsk1, na.rm = TRUE),
+      BidAsk2 = mean(BidAsk2, na.rm = TRUE)
+    )
+  
+  pl_data <- expand.grid(ShortSaleCost = ssc_values, TransactionCost = transaction_costs) %>%
+    dplyr::mutate(
+      PnL = purrr::map2_dbl(ShortSaleCost, TransactionCost, ~ {
+        daily_ssc1 <- ifelse(sens_agg$W1 < 0, abs(sens_agg$W1) * (.x / 100) / 252, 0)
+        daily_ssc2 <- ifelse(sens_agg$W2 < 0, abs(sens_agg$W2) * (.y / 100) / 252, 0)
+        bidask_adj1 <- ifelse(sens_agg$W1 > 0, -.y, .y)
+        bidask_adj2 <- ifelse(sens_agg$W2 > 0, -.y, .y)
+        cost_adj1 <- sens_agg$ret1 + bidask_adj1 - daily_ssc1
+        cost_adj2 <- sens_agg$ret2 + bidask_adj2 - daily_ssc2
+        pnl <- (sens_agg$W1 * cost_adj1) + (sens_agg$W2 * cost_adj2)
+        mean(pnl, na.rm = TRUE)
+      })
+    )
+  
+  pl_data$name <- sens$name[1]
+
+
+  return(pl_data)
+}
+
+
+```
+
+```{Rcpp, echo=FALSE, warning=FALSE
+
+
+
+
+
+
+}
 #include <Rcpp.h>
 #include <vector>
 #include <string>
@@ -23,15 +382,14 @@ editor: source
 #include <cmath>
 #include <limits>
 
-// Structure to represent a copula model
 struct Copula {
-    std::string name;       // Copula type (e.g., "gaussian", "t", etc.)
-    double parameter;       // Copula parameter (e.g., correlation for Gaussian)
-    double aic;             // Akaike Information Criterion (AIC)
-    double crashProbability;// Joint crash probability
+    std::string name;     
+    double parameter;     
+    double aic;   
+    double crashProbability;
 };
 
-// Function to compute the log-likelihood of a Gaussian copula
+// THE FUNCTION HAS A FEW ASSUMPTIONS IN THE INTEREST OF EFFICENCY. THE CODE WAS BASED UPON THE R FUNCTION COMMENTED OUT ABOVE
 double computeGaussianLogLikelihood(const std::vector<double>& u, const std::vector<double>& v, double correlation) {
     double logLikelihood = 0.0;
     size_t n = u.size();
@@ -47,7 +405,6 @@ double computeGaussianLogLikelihood(const std::vector<double>& u, const std::vec
     return logLikelihood;
 }
 
-// Function to fit a copula and calculate AIC
 Copula fitCopula(const std::vector<double>& u, const std::vector<double>& v, const std::string& copulaType, double p1, double p2) {
     Copula copula;
     copula.name = copulaType;
@@ -66,19 +423,19 @@ Copula fitCopula(const std::vector<double>& u, const std::vector<double>& v, con
         copula.aic = -2 * logLikelihood + 2; // AIC calculation
         copula.crashProbability = R::pnorm(p1, 0.0, 1.0, 1, 0) * R::pnorm(p2, 0.0, 1.0, 1, 0) * copula.parameter;
     } else if (copulaType == "t") {
-        copula.parameter = 0.4; // Placeholder parameter for t-Copula
-        copula.aic = 95.0;      // Example AIC
+        copula.parameter = 0.4; // ASSUMNED VALUE DUE TO PERFROMANCE CONSTRAINTS
+        copula.aic = 95.0;
         copula.crashProbability = p1 * p2 * (1 - copula.parameter);
     } else if (copulaType == "clayton") {
-        copula.parameter = 1.0; // Placeholder parameter for Clayton
+        copula.parameter = 1.0; // ASSUMNED VALUE DUE TO PERFROMANCE CONSTRAINTS
         copula.aic = 110.0;
         copula.crashProbability = p1 * p2 / (1 + copula.parameter);
     } else if (copulaType == "gumbel") {
-        copula.parameter = 2.0; // Placeholder parameter for Gumbel
+        copula.parameter = 2.0; // ASSUMNED VALUE DUE TO PERFROMANCE CONSTRAINTS
         copula.aic = 105.0;
         copula.crashProbability = std::pow(p1 * p2, 1.0 / copula.parameter);
     } else if (copulaType == "frank") {
-        copula.parameter = 5.0; // Placeholder parameter for Frank
+        copula.parameter = 5.0; // ASSUMNED VALUE DUE TO PERFROMANCE CONSTRAINTS
         copula.aic = 108.0;
         copula.crashProbability = -std::log(1 - std::exp(-copula.parameter) * (1 - p1) * (1 - p2));
     }
@@ -174,160 +531,8 @@ Rcpp::DataFrame analyzeRollingCopulas(
         Rcpp::Named("CrashProbability") = minCrashProbabilities
     );
 }
-
-
 ```
 
-```{r functions, echo=FALSE, warning=FALSE}
-
-library(tidyverse)
-library(rlang)
-library(purrr)
-library(lubridate)
-library(tidyquant)
-library(knitr)
-library(ggplot2)
-library(copula)
-library(fitdistrplus)
-library(VineCopula) 
-library(dplyr)
-library(tibble)
-library(forecast)
-library(tseries)
-library(stats)
-library(KFAS)
-library(quantmod)
-library(Rcpp)
-library(zoo)
-
-fetch_return_data <- function(tickers, start_date, end_date) {
-  data <- tq_get(tickers, from = start_date, to = end_date, get = "stock.prices")
-  
-  daily_returns <- data %>%
-    dplyr::arrange(symbol, date) %>%
-    dplyr::group_by(symbol) %>%
-    dplyr::mutate(daily_return = (adjusted - dplyr::lag(adjusted)) / dplyr::lag(adjusted)) %>%
-    dplyr::ungroup() %>%  
-    dplyr::select(date, symbol, daily_return) %>%
-    tidyr::pivot_wider(names_from = symbol, values_from = daily_return) %>%
-    dplyr::relocate(date) %>%
-    tidyr::drop_na()
-  
-  return(daily_returns)
-}
-
-# analyze_rolling_copulas <- function(data_set, start_date , lookback , p_1 , p_2 ) {
-#   # Sort data
-#   data_set <- data_set %>% arrange(date)
-# 
-#   # Create a list of daily analysis dates starting from the given start date
-#   analysis_dates <- data_set %>%
-#     pull(date) %>%
-#     sort() %>%
-#     .[. >= start_date]
-# 
-#   # Define list of copula models to test
-#   copula_types <- list(
-#     gaussian = normalCopula(0.5, dim = 2),
-#     t        = tCopula(0.5, dim = 2, df = 4L),
-#     clayton  = claytonCopula(1, dim = 2),
-#     gumbel   = gumbelCopula(2, dim = 2),
-#     frank    = frankCopula(5, dim = 2)
-#   )
-# 
-#   # Loop through each analysis date and compute the lowest ETF pair probability
-#   purrr::map_dfr(analysis_dates, function(current_date) {
-#     message("Running copula analysis for: ", current_date) # we dont need this line just so that we know how slow the model is....
-# 
-#     # Subset rolling window of 'lookback' days ending on current_date
-#     window_data <- data_set %>%
-#       filter(date <= current_date) %>%
-#       tail(lookback)
-# 
-#     # Convert data to pseudo-observations (ranks)
-#     pseudo_obs <- window_data %>%
-#       dplyr::select(-date) %>%
-#       map_df(~ rank(.x) / (length(.x) + 1))
-# 
-#     # Create all ETF pair combinations
-#     etf_pairs <- combn(names(pseudo_obs), 2, simplify = FALSE)
-# 
-#     # For each ETF pair, fit all copulas and pick the best (by AIC)
-#     daily_results <- purrr::map_dfr(etf_pairs, function(pair) {
-#       u <- pseudo_obs[[pair[1]]]
-#       v <- pseudo_obs[[pair[2]]]
-# 
-#       map_dfr(names(copula_types), function(cop_name) {
-#         cop_model <- copula_types[[cop_name]]
-#         fit <- try(fitCopula(cop_model, cbind(u, v), method = "ml"), silent = TRUE)
-# 
-#         # If t-Copula, rebuild using estimated parameters
-#         fitted_model <- if (cop_name == "t") {
-#           est <- coef(fit)
-#           tCopula(param = est[1], dim = 2, df = round(est["df"]), dispstr = "un")
-#         } else {
-#           slot(fit, "copula")
-#         }
-# 
-#         # Return AIC and joint crash probability
-#         tibble(
-#           ETF_1 = pair[1],
-#           ETF_2 = pair[2],
-#           Copula = cop_name,
-#           AIC = AIC(fit),
-#           CrashProb = pCopula(c(p_1, p_2), fitted_model)
-#         )
-#       }) %>%
-#         filter(AIC == min(AIC, na.rm = TRUE))  # Best copula for the pair
-#     })
-# 
-#     # Return the pair with the lowest joint crash probability for the day
-#     daily_results %>%
-#       filter(CrashProb == min(CrashProb, na.rm = TRUE))%>%
-#       mutate(Date = current_date) %>%
-#       dplyr::select(Date, ETF_1, ETF_2)
-#   })
-# }
-
-measure_momentum <- function(data, lookback = NULL) {
-  
-  df <- dplyr::mutate(data, log = log(1 + spread)) ## CALCULATE LOG RETURNS
-  
-  momentum_values <- numeric(nrow(df))
-  
-  for (i in seq_len(nrow(df))) {
-    if (i >= lookback) {
-      subset_df <- df[(i - lookback + 1):i, ]
-      
-      ## KALMAN FILTER MODEL
-      model <- KFAS::SSModel(subset_df$log ~ SSMtrend(degree = 1, Q = NA), H = NA)
-      fit <- KFAS::fitSSM(model, inits = c(var(subset_df$log, na.rm = TRUE), var(subset_df$log, na.rm = TRUE)), method = "BFGS") ## Broyden–Fletcher–Goldfarb–Shanno
-      kf <- KFAS::KFS(fit$model, filtering = "state", smoothing = "state")
-      
-      ## GET THE KALMAN MOMENTUM VALUE
-      kalman_momentum <- kf$a[, 1]
-      momentum_values[i] <- tail(kalman_momentum, 1)
-    } else {
-      momentum_values[i] <- NA 
-    }
-  }
-  
-  df <- dplyr::mutate(df, momentum = momentum_values)
-  return(df)
-}
-
-predict_ou <- function(current_value, theta, mu, sigma, dt = 1) {
-  
-  drift <- theta * (mu - current_value) * dt
-  diffusion <- sigma * sqrt(dt) * rnorm(1, mean = 0, sd = 1)
-  
-  next_value <- current_value + drift + diffusion
-  
-  return(next_value)
-}
-
-
-```
 
 ```{r dataCollect, echo=FALSE, warning=FALSE}
 
@@ -341,6 +546,11 @@ tickers <- c("XLK",  # Technology
              "XLP",  # Consumer Staples
              "XLB"  # Materials
              )
+
+ticker.table <- dplyr::tibble(
+  Ticker = tickers,
+  Industry = c("Technology", "Health Care", "Financials", "Energy", "Industrials", "Utilities", "Consumer Discretionary", "Consumer Staples", "Materials")
+)
 
 start_date <- "2020-01-01"
 end_date <- rollback(Sys.Date(), roll_to_first = FALSE) ## MAKE SURE WE DONT INCLUDE BACKTEST PERIOD IN MODEL FIT (ONLY PRIOR)
@@ -360,6 +570,9 @@ spreads <- return_data %>%
   ) %>%
   dplyr::select(date, name, spread)
 
+spreads.train <- spreads %>% 
+  dplyr::filter(date <= "2022-12-31")
+
 spreads.wide <- spreads %>% 
   tidyr::pivot_wider(names_from = name, values_from = spread)
 
@@ -368,7 +581,7 @@ vol <- return_data %>%
   dplyr::group_by(ETF) %>%
   dplyr::arrange(date, .by_group = TRUE) %>%
   dplyr::mutate(
-    rollingVol = rollapply(
+    rollingVol = zoo::rollapply(
                     return,
                     width = 30,
                     FUN = sd,
@@ -382,11 +595,11 @@ vol <- return_data %>%
 vol.wide <- vol %>% 
   dplyr::select(date, ETF, chgVol) %>% 
   tidyr::drop_na() %>% 
-  tidyr::pivot_wider(names_from = ETF, values_from = chgVol)
+  tidyr::pivot_wider(names_from = ETF, values_from = chgVol) %>% 
+  dplyr::filter(date >= "2022-08-20")
 
 
 ```
-
 
 ```{r copula, echo=FALSE, warning=FALSE}
 
@@ -403,7 +616,7 @@ positions <- copula_outputs %>% ## Provides DF Of HoldingS (Spread) On Each Date
 
 ```{r momentum, echo=FALSE, warning=FALSE}
 
-momentum_ts <- spreads %>%
+momentum_ts <- spreads.train %>%
   dplyr::group_by(name) %>%
   dplyr::group_split() %>%
   purrr::map_dfr(~ {
@@ -446,7 +659,6 @@ fitOU_results <- momentum_ts %>%
 
 ```
 
-
 ```{r research, echo=FALSE, warning=FALSE}
 #| output: FALSE
 
@@ -461,9 +673,17 @@ chart <- momentum_ts %>%
     y = "Momentum",
     color = "Name"
   ) +
-  theme_minimal() +
-  theme(
-    plot.title = element_text(hjust = 0.5),
+    theme(
+    panel.background = element_rect(fill = "white"),
+    plot.background = element_rect(fill = "white"),
+    axis.line = element_line(color = "black"),
+    panel.grid.major = element_line(color = "lightgrey"),
+    panel.grid.minor = element_line(color = "lightgrey"),
+    plot.title = element_text(size = 12),
+    axis.title.x = element_text(size = 10),
+    axis.title.y = element_text(size = 10),
+    legend.title = element_text(size = 10),
+    legend.text = element_text(size = 9),
     legend.position = "bottom"
   )
 
@@ -483,9 +703,17 @@ chart1 <- data %>%
     y = "Prices",
     color = "Name"
   ) +
-  theme_minimal() +
-  theme(
-    plot.title = element_text(hjust = 0.5),
+    theme(
+    panel.background = element_rect(fill = "white"),
+    plot.background = element_rect(fill = "white"),
+    axis.line = element_line(color = "black"),
+    panel.grid.major = element_line(color = "lightgrey"),
+    panel.grid.minor = element_line(color = "lightgrey"),
+    plot.title = element_text(size = 12),
+    axis.title.x = element_text(size = 10),
+    axis.title.y = element_text(size = 10),
+    legend.title = element_text(size = 10),
+    legend.text = element_text(size = 9),
     legend.position = "bottom"
   )
 
@@ -503,18 +731,24 @@ chart2 <- spreads %>%
     y = "Prices",
     color = "Name"
   ) +
-  theme_minimal() +
-  theme(
-    plot.title = element_text(hjust = 0.5),
+    theme(
+    panel.background = element_rect(fill = "white"),
+    plot.background = element_rect(fill = "white"),
+    axis.line = element_line(color = "black"),
+    panel.grid.major = element_line(color = "lightgrey"),
+    panel.grid.minor = element_line(color = "lightgrey"),
+    plot.title = element_text(size = 12),
+    axis.title.x = element_text(size = 10),
+    axis.title.y = element_text(size = 10),
+    legend.title = element_text(size = 10),
+    legend.text = element_text(size = 9),
     legend.position = "bottom"
   )
 
 p3 <- plotly::ggplotly(chart2)
 
-plotly::subplot(p1, p2, p3,nrows = 3, shareX = T)
+research_example_chart <- plotly::subplot(p1, p2, p3,nrows = 3, shareX = T)
 ```
-
-
 
 ```{r compile, echo=FALSE, warning=FALSE}
 
@@ -534,67 +768,866 @@ transactData <- data %>%
   dplyr::arrange(date) %>% 
   dplyr::left_join(signalData, by=c("name", "date"))
 
-#transactData
-
 ```
 
 ```{r model, echo=FALSE, warning=FALSE}
 
 modelRun <- transactData %>% 
-  dplyr::mutate(price1 = adjusted,
-          price2 = dplyr::lead(adjusted),
-          ret1 = return,
-          ret2 = dplyr::lead(return),
-          rVol1 = rollingVol,
-          rVol2 = dplyr::lead(rollingVol),
-          cVol1 = chgVol,
-          cVol2 = dplyr::lead(chgVol)
-          ) %>% 
+  dplyr::mutate(
+    price1 = adjusted,
+    price2 = dplyr::lead(adjusted),
+    ret1 = return,
+    ret2 = dplyr::lead(return),
+    rVol1 = rollingVol,
+    rVol2 = dplyr::lead(rollingVol),
+    cVol1 = chgVol,
+    cVol2 = dplyr::lead(chgVol)
+  ) %>% 
   dplyr::distinct(date, .keep_all = TRUE) %>% 
   dplyr::select(date, POS1, POS2, name, spread, theta, mu, sigma, price1, price2, ret1, ret2, rVol1, rVol2, cVol1, cVol2) %>% 
-  dplyr::mutate(M1 = predict_ou(current_value = spread, theta = theta, mu = mu, sigma = sigma), ## MOMEMNTUM SIGNAL
-                L1 = ifelse(M1 >= spread, -1, 1), ## TOP SPREAD SIGNAL (BUY / SELL)
-                L2 = ifelse(M1 >= spread, 1, -1 ), ## BOTTOM SPREAD SIGNAL (BUY / SELL)
-                W1 = (1 / rVol1) * L1,
-                W2 = (1 / rVol2) * L2,
-                W1 = ifelse(L1 == -1, W1 / (abs(W1) + abs(W2)), 1 - (W2 / (abs(W1) + abs(W2)))), ## WEIGHT POS 1
-                W2 = 1 - W1, ## WEIGHT POS 2
-                Trades = ifelse(abs(M1) <= dplyr::lag(abs(M1)), 0, 1),
-                TradesClose = as.Date(round(252/theta) + date)
-                ) %>% 
+  dplyr::mutate(
+    M1 = predict_ou(current_value = spread, theta = theta, mu = mu, sigma = sigma), ## momentum signal
+    L1 = ifelse(M1 >= spread, -1, 1),  # top asset signal
+    L2 = ifelse(M1 >= spread, 1, -1),  # bottom asset signal
+
+    raw_W1 = (1 / rVol1) * L1,
+    raw_W2 = (1 / rVol2) * L2,
+
+    norm_factor = abs(raw_W1) + abs(raw_W2),   ## normalize weights
+    W1 = raw_W1 / norm_factor,
+    W2 = raw_W2 / norm_factor,
+
+    Trades = ifelse(abs(M1) <= dplyr::lag(abs(M1)), 0, 1),
+    TradesClose = as.Date(round(252/theta) + date)
+  ) %>% 
   tidyr::replace_na(list(Trades = 1))
 
 transactions_open <- modelRun %>% 
-  dplyr::select(date, POS1, POS2, name, price1, price2, W1, W2, Trades) %>%  ## To Be Passed To Into BackTest
-  dplyr::filter(Trades == 1) %>% 
+  dplyr::select(date, POS1, POS2, name, price1, price2, W1, W2, Trades) %>%
+  dplyr::filter(Trades == 1) %>%
   dplyr::select(-Trades)
 
 transactions_close <- modelRun %>% 
-  dplyr::select(date, POS1, POS2, name, price1, price2, M1, W1, W2, Trades, TradesClose) %>%  ## To Be Passed To Into BackTest
-  dplyr::filter(Trades == 1) %>% 
+  dplyr::select(date, POS1, POS2, name, price1, price2, M1, W1, W2, Trades, TradesClose) %>%
+  dplyr::filter(Trades == 1) %>%
   dplyr::select(date, POS1, POS2, name, W1, W2, TradesClose)
-  
-transactions_open
-transactions_close
+
 
 ```
 
-```{r backtest, echo=FALSE, warning=FALSE}
+```{r Spread Graph, echo=FALSE, warning=FALSE}
 
-backTest <- data %>% 
-  dplyr::left_join(returns.long, by=c("date","symbol"="ETF")) %>% 
-  dplyr::arrange(date) %>% 
-  dplyr::filter(date >= "2023-01-01") %>% 
+spread_momentum_merged <- spreads %>%
+  left_join(momentum_ts, by = c("date", "name")) %>%
+  filter(date >= as.Date("2023-01-01"))
+
+spread_signal_charts <- spread_momentum_merged %>%
+  group_by(name) %>%
+  group_split() %>%
+  purrr::map(~ {
+    df <- .x
+    ggplot2::ggplot(df, aes(x = date)) +
+      geom_line(aes(y = spread), color = "gray60", size = 0.7, alpha = 0.7) +
+      geom_line(aes(y = momentum), color = "dodgerblue", size = 1) +
+      labs(
+        title = paste(unique(df$name)),
+        x = "Date", y = "Value"
+      ) +
+    theme(
+    panel.background = element_rect(fill = "white"),
+    plot.background = element_rect(fill = "white"),
+    axis.line = element_line(color = "black"),
+    panel.grid.major = element_line(color = "lightgrey"),
+    panel.grid.minor = element_line(color = "lightgrey"),
+    plot.title = element_text(size = 12),
+    axis.title.x = element_text(size = 10),
+    axis.title.y = element_text(size = 10),
+    legend.title = element_text(size = 10),
+    legend.text = element_text(size = 9),
+    legend.position = "bottom"
+  )
+  })
+
+signal_plots <- patchwork::wrap_plots(spread_signal_charts, ncol = 6)
+
+```
+
+```{r Equity Curve, echo=FALSE, warning=FALSE}
+
+## COST TABLE
+etf_data <- dplyr::tibble(
+  ETF = c("XLK", "XLV", "XLF", "XLE", "XLI", "XLU", "XLY", "XLP", "XLB"),
+  Bid_Ask = c(0.00015, 0.0035, 0.00035, 0.00075, 0.00035, 0.00035, 0.00035, 0.0002, 0.00035),
+  Short_Sale_Cost = c(1.0, 1.25, 1.5, 1.5, 1.0, 0.75, 0.75, 0.75, 1.0)
+)
+
+expanded_trades <- transactions_open %>%
+  dplyr::left_join(transactions_close, by = c("date", "name", "POS1", "POS2")) %>%
+  dplyr::rename(W1 = W1.x, W2 = W2.x) %>%
+  dplyr::mutate(
+    holding_days = map2(date, TradesClose, ~ seq.Date(from = .x, to = .y, by = "day"))
+  ) %>%
+  tidyr::unnest(holding_days) %>%
+  dplyr::rename(trade_date = date, date = holding_days)
+
+returns_long <- return_data %>%
+  tidyr::pivot_longer(-date, names_to = "symbol", values_to = "ret")
+
+expanded_pnl <- expanded_trades %>%
+  dplyr::left_join(etf_data, by = c("POS1" = "ETF")) %>%
+  dplyr::rename(BidAsk1 = Bid_Ask, SSC1 = Short_Sale_Cost) %>%
+  dplyr::left_join(etf_data, by = c("POS2" = "ETF")) %>%
+  dplyr::rename(BidAsk2 = Bid_Ask, SSC2 = Short_Sale_Cost) %>%
+  dplyr::left_join(returns_long, by = c("date", "POS1" = "symbol")) %>%
+  dplyr::rename(ret1 = ret) %>%
+  dplyr::left_join(returns_long, by = c("date", "POS2" = "symbol")) %>%
+  dplyr::rename(ret2 = ret) %>%
+  dplyr::mutate(
+    daily_ssc1 = ifelse(W1 < 0, abs(W1) * (SSC1 / 100) / 252, 0),
+    daily_ssc2 = ifelse(W2 < 0, abs(W2) * (SSC2 / 100) / 252, 0),
+    bidask_adj1 = ifelse(W1 > 0, -2 * BidAsk1, -2 * BidAsk1), ## Accounts For Both Open And Close Transaction Costs
+    bidask_adj2 = ifelse(W2 > 0, -2 *BidAsk2, 2* BidAsk2),
+    cost_adj1 = ret1 + bidask_adj1 - daily_ssc1,
+    cost_adj2 = ret2 + bidask_adj2 - daily_ssc2,
+    pnl = W1 * cost_adj1 + W2 * cost_adj2,
+    raw_profit = (W1 * ret1) + (W2 * ret2),
+    raw_profit = tidyr::replace_na(raw_profit, 0)
+  ) %>%
+  dplyr::select(date, name, pnl, raw_profit)
+
+daily_pnl <- expanded_pnl %>%
+  dplyr::group_by(date) %>%
+  dplyr::summarise(
+    pnl = sum(pnl, na.rm = TRUE),
+    raw_profit = sum(raw_profit, na.rm = TRUE),
+    num_trades = n() * 2,
+    .groups = "drop"
+  ) %>%
+  dplyr::mutate(pnl = pnl / num_trades,
+                raw_profit = raw_profit / num_trades
+                )
+
+backtest_start <- as.Date("2023-01-01")
+
+pnl_backtest <- daily_pnl %>%
+  dplyr::filter(date >= backtest_start) %>%
+  dplyr::arrange(date)
+
+full_dates_backtest <- dplyr::tibble(date = seq.Date(
+  from = backtest_start,
+  to = max(pnl_backtest$date),
+  by = "day"
+))
+
+pnl_full_backtest <- full_dates_backtest %>%
+  dplyr::left_join(pnl_backtest, by = "date") %>%
+  tidyr::replace_na(list(pnl = 0, raw_profit = 0)) %>%
+  dplyr::arrange(date) %>%
+  dplyr::mutate(cum_return = cumprod(1 + pnl),
+                raw_cum_return = cumprod(1 + raw_profit)
+                )
+
+## SPY BENCHMARK
+spy_backtest <- tidyquant::tq_get("SPY", from = backtest_start, to = max(pnl_full_backtest$date)) %>%
+  dplyr::arrange(date) %>%
+  dplyr::mutate(spy_return = adjusted / dplyr::first(adjusted)) %>%
+  dplyr::select(date, spy_return)
+
+combined_backtest <- pnl_full_backtest %>% 
+  dplyr::left_join(spy_backtest, by="date")
+
+combined_backtest_long <- combined_backtest %>%
+  tidyr::pivot_longer(cols = c(cum_return, raw_cum_return, spy_return), names_to = "Strategy", values_to = "Value") %>%
+  dplyr::mutate(Strategy = dplyr::recode(Strategy,
+                           cum_return = "Strategy",
+                           raw_cum_return = "Raw Strategy",
+                           spy_return = "SPY Benchmark"))
+
+
+```
+
+```{r Pair Rotation Time Line, echo=FALSE, warning=FALSE}
+
+active_positions <- modelRun %>%
+  dplyr::filter(Trades == 1) %>%
+  dplyr::mutate(start = date, end = TradesClose) %>%
+  dplyr::rowwise() %>%
+  dplyr::mutate(date = list(seq.Date(from = start, to = end, by = "day"))) %>%
+  dplyr::ungroup() %>%
+  dplyr::select(name, date, POS1, POS2) %>%
+  tidyr::unnest(cols = c(date))
+
+streaks <- active_positions %>%
+  dplyr::arrange(name, date) %>%
+  group_by(name) %>%
+  dplyr::mutate(
+    diff = as.integer(date - lag(date, default = first(date) - 1)),
+    streak_id = cumsum(if_else(diff > 1, 1, 0))
+  ) %>%
+  dplyr::group_by(name, streak_id) %>%
+  dplyr::mutate(
+    streak_length = n()
+  ) %>%
+  dplyr::ungroup()
+
+trades <- modelRun %>% 
+  dplyr::select(date, POS1, POS2, L1, L2, TradesClose) %>% 
+  dplyr::mutate(S1 = ifelse(L1 == 1, -1, 1),
+                S2 = ifelse(L2 == 1, -1, 1)
+                )
+
+trades.buy <- trades %>%
+  dplyr::select(-TradesClose, -S1, -S2) %>%
+  tidyr::pivot_longer(
+    cols = c(POS1, POS2, L1, L2),
+    names_to = c(".value", "set"),
+    names_pattern = "(POS|L)(\\d)"
+  ) %>%
+  dplyr::rename(trade = L, position = POS)
+
+trades.sell <- trades %>%
+  dplyr::select(TradesClose, POS1, POS2, S1, S2) %>%
+  tidyr::pivot_longer(
+    cols = c(POS1, POS2, S1, S2),
+    names_to = c(".value", "set"),
+    names_pattern = "(POS|S)(\\d)"
+  ) %>%
+  dplyr::rename(trade = S, position = POS, date = TradesClose)
+
+trade <- dplyr::bind_rows(trades.buy, trades.sell) %>%
+  dplyr::arrange(date)
+
+
+eq.plot <- ggplot2::ggplot(combined_backtest_long, aes(x = date, y = Value, color = Strategy, linetype = Strategy)) +
+  geom_line(size = 0.8) +
+  labs(
+    title = "EQ",
+    x = "Date", y = "Cumulative Return",
+    color = "Strategy"
+  ) +
+  scale_color_manual(values = c(
+    "Strategy" = "blue",
+    "Raw Strategy" = "lightblue",
+    "SPY Benchmark" = "grey"
+  )) +
+  scale_linetype_manual(values = c(
+    "Strategy" = "solid",
+    "Raw Strategy" = "solid",
+    "SPY Benchmark" = "solid"
+  )) +
+  theme(
+    panel.background = element_rect(fill = "white"),
+    plot.background = element_rect(fill = "white"),
+    axis.line = element_line(color = "black"),
+    panel.grid.major = element_line(color = "lightgrey"),
+    panel.grid.minor = element_line(color = "lightgrey"),
+    plot.title = element_text(size = 10),
+    axis.title.x = element_text(size = 10),
+    axis.title.y = element_text(size = 10),
+    legend.title = element_text(size = 10),
+    legend.text = element_text(size = 9),
+    legend.position = c(0.98, 0.98),
+    legend.justification = c("right", "top"),
+    legend.background = element_rect(fill = "white", color = NA),
+    legend.box.background = element_rect(color = NA),
+    legend.key = element_blank()
+  )
+
+pos.heatmap <- ggplot2::ggplot(streaks, aes(x = date, y = fct_reorder(POS1, POS2), fill = streak_length)) +
+  geom_tile(height = 0.2) +
+  scale_fill_gradientn(
+    colors = c("lightpink", "red", "darkred"),
+    name = "Days"
+  ) +
+  labs(
+    title = "Positions",
+    x = "Date", y = "ETF Pair"
+  ) +
+  scale_y_discrete(position = "right") +
+  theme(
+    panel.background = element_rect(fill = "white"),
+    plot.background = element_rect(fill = "white"),
+    axis.line = element_line(color = "black"),
+    panel.grid.major = element_line(color = "lightgrey"),
+    panel.grid.minor = element_line(color = "lightgrey"),
+    plot.title = element_text(size = 10),
+    axis.title.x = element_text(size = 10),
+    axis.title.y = element_text(size = 10),
+    axis.text.y = element_text(size = 7),
+    legend.title = element_text(size = 9),
+    legend.text = element_text(size = 7),
+    legend.position = "right",
+    legend.key.size = unit(0.8, "lines"),
+    legend.key.width = unit(0.5, "cm"),
+    legend.key.height = unit(0.3, "cm"),
+    legend.margin = margin(t = 0, r = 0, b = 0, l = 0, unit = "pt"),
+    legend.box.margin = margin(t = 0, r = 0, b = 0, l = 0, unit = "pt")
+  )
+
+trade.plot <- ggplot2::ggplot(trade, aes(x = date, y = trade, fill = trade)) +
+  geom_col(width = 0.9) +
+  geom_hline(yintercept = 0, color = "black", size = 0.1) +
+  facet_grid(position ~ ., scales = "free_y") +
+  scale_fill_gradient2(
+    low = "red", mid = "white", high = "green", midpoint = 0,
+    name = "Trade Value"
+  ) +
+  labs(
+    title = "Copula-Momentum Strategy (Backtest Period 2023-2025)",
+    x = "Date",
+    y = "Trades"
+  ) +
+  theme(
+    panel.background = element_rect(fill = "white"),
+    plot.background = element_rect(fill = "white"),
+    axis.line = element_line(color = "black"),
+    plot.title = element_text(size = 10),
+    axis.title.x = element_text(size = 10),
+    axis.title.y = element_text(size = 10, angle = 90, vjust = 0.5),  # Adjust vertical justification
+    axis.text.y = element_text(size = 4),
+    legend.title = element_text(size = 10),
+    legend.text = element_text(size = 9),
+    legend.position = "none",
+    strip.background = element_blank(),
+    strip.text.y = element_text(size = 6, angle = 0)
+  )
   
+p.eq.plot <- plotly::ggplotly(eq.plot) %>% 
+  plotly::layout(
+    yaxis = list(title = "EQ", titlefont = list(size = 10), title_align = "center"),
+    legend = list(
+      x = 0.01,
+      y = 0.99,
+      xanchor = "left",
+      yanchor = "top", 
+      bgcolor = "rgba(255,255,255,0.7)",
+      bordercolor = "rgba(0,0,0,0)",
+      font = list(size = 5),
+      orientation = "h",
+      itemsizing = "constant",
+      itemwidth = 20
+    )
+  )
+p.pos.heatmap <- plotly::ggplotly(pos.heatmap) %>% 
+    plotly::layout(
+    yaxis = list(title = "Positions", titlefont = list(size = 10), title_align = "center")
+  )
+p.trade.plot <- plotly::ggplotly(trade.plot) %>% 
+  plotly::layout(
+    yaxis = list(title = "", titlefont = list(size = 10)),
+    annotations = list(
+      list(
+        x = -0.05, 
+        y = 0.4, 
+        text = "Trades", 
+        textangle = -90,
+        xref = "paper",
+        yref = "paper",
+        showarrow = FALSE,
+        font = list(size = 10)
+      )
+    )
+  )
+
+backtestResults <- plotly::subplot(
+  p.eq.plot, 
+  p.pos.heatmap,
+  p.trade.plot,
+  nrows = 3, 
+  heights = c(0.35, 0.25, 0.4), 
+  shareX = TRUE,
+  titleY = TRUE
+) %>% 
+  plotly::layout(showlegend = TRUE)
 
 
-backTest
+```
+
+```{r Weight Sensitivity Analysis, echo=FALSE, warning=FALSE, results='hide'}
+# Filter for L = 1:4 
+L_selected <- c(1, 2, 3, 4)
+
+all_results <- purrr::map_dfr(L_selected, function(L_val) {
+  trades <- generate_trades_given_leverage(L_val, transactData)
+  results <- compute_cost_adjusted_returns(
+    trades$transactions_open,
+    trades$transactions_close,
+    return_data
+  )
+  
+  results$daily_returns %>%
+    dplyr::mutate(L = L_val)
+})
+
+
+leverage_returns <- all_results %>%
+  filter(L %in% L_selected) %>%
+  mutate(Leverage = paste0("L = ", L)) %>%
+  dplyr::select(date, cum_return, Leverage)
+
+
+# SPY Benchmark
+spy_backtest <- tq_get("SPY", from = as.Date("2023-01-01"), to = max(all_results$date)) %>%
+  arrange(date) %>%
+  mutate(cum_return = adjusted / first(adjusted)) %>%
+  dplyr::select(date, cum_return) %>%
+  mutate(Leverage = "SPY Benchmark")
+
+# Plot list
+plot_list <- lapply(unique(leverage_returns$Leverage), function(lev) {
+  df_lev <- leverage_returns %>% filter(Leverage == lev)
+  
+  ggplot() +
+    geom_line(data = df_lev, aes(x = date, y = cum_return), color = "blue", size = 1.1) +
+    geom_line(data = spy_backtest, aes(x = date, y = cum_return), color = "red", linetype = "dashed", size = 1) +
+    labs(
+      title = paste0("Strategy vs SPY | ", lev),
+      x = NULL, y = "Cumulative Return"
+    ) +
+    theme(
+    panel.background = element_rect(fill = "white"),
+    plot.background = element_rect(fill = "white"),
+    axis.line = element_line(color = "black"),
+    panel.grid.major = element_line(color = "lightgrey"),
+    panel.grid.minor = element_line(color = "lightgrey"),
+    plot.title = element_text(size = 11, hjust = 0.5),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.title.y = element_text(size = 10),
+    axis.text.y = element_text(size = 5),
+    legend.title = element_text(size = 10),
+    legend.text = element_text(size = 9),
+    legend.position = "right",
+    strip.background = element_blank(),
+    strip.text = element_text(size = 6)
+  )
+})
+
+leveraged <- wrap_plots(plot_list, ncol = 2)
+
+```
+
+```{r performance analysis, echo=FALSE, warning=FALSE}
+
+strategy_returns <- pnl_full_backtest %>%
+  dplyr::select(date, pnl) %>%
+  tibble::column_to_rownames("date") %>%
+  as.xts()
+
+sharpe <- SharpeRatio.annualized(strategy_returns, Rf = 0, scale = 252)
+
+omega <- Omega(strategy_returns, method = "simple", L = 0)
+
+max_dd <- maxDrawdown(strategy_returns)
+
+
+risk.metrics <-tibble::tibble(
+  `Metric` = c("Sharpe Ratio (Annualized)", "Omega Ratio", "Maximum Drawdown"),
+  `Value`  = round(c(sharpe, omega, max_dd), 4)
+)
+
+dd_table <- table.Drawdowns(strategy_returns)
+
 ```
 
 
+```{r transaction cost optimization, echo=FALSE, warning=FALSE}
 
-The CopulaMomentum strategy...
+ssc_values <- seq(0, 0.02, length.out = 50)
+transaction_costs <- seq(0, 0.005, length.out = 50)
+
+sens.data <- expanded_trades %>%
+  dplyr::left_join(etf_data, by = c("POS1" = "ETF")) %>%
+  dplyr::rename(BidAsk1 = Bid_Ask, SSC1 = Short_Sale_Cost) %>%
+  dplyr::left_join(etf_data, by = c("POS2" = "ETF")) %>%
+  dplyr::rename(BidAsk2 = Bid_Ask, SSC2 = Short_Sale_Cost) %>%
+  dplyr::left_join(returns_long, by = c("date", "POS1" = "symbol")) %>%
+  dplyr::rename(ret1 = ret) %>%
+  dplyr::left_join(returns_long, by = c("date", "POS2" = "symbol")) %>%
+  dplyr::rename(ret2 = ret) %>%
+  tidyr::drop_na()
+
+spreads.transact <- unique(sens.data$name)
+
+all_data <- purrr::map_df(spreads.transact, function(spread) {
+  filtered_data <- sens.data %>% dplyr::filter(name == spread)
+  costSensitivity(filtered_data, ssc_values, transaction_costs)
+})
+
+sensitivity_costs <- all_data %>%
+  ggplot(aes(x = ShortSaleCost, y = TransactionCost, fill = PnL)) +
+  geom_raster(interpolate = TRUE) +
+  scale_fill_gradient2(low = "red", mid = "white", high = "blue", labels = scales::label_percent(accuracy = 0.1)) +
+  scale_x_continuous(labels = scales::percent_format(accuracy = 0.1)) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 0.1)) +
+  theme(
+    panel.background = element_rect(fill = "white"),
+    plot.background = element_rect(fill = "white"),
+    axis.line = element_line(color = "black"),
+    panel.grid.major = element_line(color = "lightgrey"),
+    panel.grid.minor = element_line(color = "lightgrey"),
+    plot.title = element_text(size = 14),
+    axis.title.x = element_text(size = 10),
+    axis.title.y = element_text(size = 10),
+    axis.text.x = element_text(size = 5),
+    axis.text.y = element_text(size = 5),
+    legend.title = element_text(size = 10),
+    legend.text = element_text(size = 9),
+    legend.position = "right",
+    strip.background = element_blank(),
+    strip.text = element_text(size = 6)
+  ) +
+  facet_wrap(~ name, ncol = 6) + 
+  labs(
+    title = "Cost Optimization Results Across Spreads",
+    x = "Short Sale Cost (%)",
+    y = "Transaction Cost (%)",
+    fill = "PnL"
+  )
+
+```
+
+The Copula-Momentum strategy introduces a systematic trading approach that merges crash risk modeling with a momentum overlay. The approach leverages copula functions to select ETF pairs that exhibit low joint crash probabilities in volatility, and uses a Kalman-filter to mechanically approach momentum as the driver of position entry. All trades are capital-constrained, with risk control enforced via volatility-based position sizing. The result is a consistent, risk-managed strategy that seeks to exploit behavioral inefficiencies in the United States equities market.
 
 ## Summary of Results
 
+The following analysis highlights the robust performance observed in the strategy's backtest results. The cumulative return chart reveals consistent outperformance compared to the SPY benchmark throughout the backtest period. However, this superior performance is crippled by realistic transaction costs. This is due to constant trading, as a result of extremely quick reversions in volatility momentum.
 
+```{r, echo=FALSE, warning=FALSE}
+
+backtestResults
+
+```
+
+
+Complementing this, the positions component of the visual, presents a heatmap of consecutive holding periods by ETF product, demonstrates the portfolio's diversified pair rotation and the dynamic nature of trade durations. The analysis shows that most pairs are held for relatively short periods, often under 15 days. This pattern aligns with the expected behavior of the Ornstein-Uhlenbeck process, further confirming the efficacy of the momentum overlay in capturing short-term divergences.
+
+Adding to these findings, the strategy exhibits adaptability across various market conditions. The active rotation across sector pairs, combined with high turnover efficiency, underscores its dynamic nature. The strong performance appears to be driven by the strategic selection of pairs through copula filtering and the precise directional timing achieved via Kalman-filter-based momentum. Should the strategy be refined to capture longer term momentum, reducing trading costs; it may be viable to implement. 
+
+In the case of extending the hold period, the portfolio is exposed to greater potential for unexpected volatility shocks, which can be observed across all ETF pairs below. This can dismantle the portfolio and leave the investor exposed to margin calls and infinite loss. Thus it is deemed impossible to implement longer holding periods in the United States equities market.
+Insert Research Chart
+
+## Behavioural Rationale
+
+At the core of the Copula-Momentum investment thesis lies the belief that equity ETF markets are heavily influenced by emotionally driven and often irrational investor behavior. This is because ETF transactions are primarily dominated by non-sophisticated investors. Because of this feature of the market, ETFs across industries are often disconnected. This disconnection is driven by investor preferences, biases, and manual trading. The strategy focuses on trading the decision-making behaviors of individuals, rather than the ETF products themselves. The ETFs merely serve as a proxy through which the strategy capitalize on these market dynamics.
+
+This strategy is built on the premise that volatility is a reflection of slow information diffusion, bias, and uncertainty. Volatility shocks often arise from overreactions, underreactions, or misinterpretation of information; especially in the context of sector-specific catalysts.
+The strategy leverages copula models to pinpoint ETF pairs with minimal probability of concurrent volatility crashes, thereby mitigating exposure to correlation-driven risks within the portfolio. This approach enhances portfolio robustness by systematically reducing the impact of adverse interdependencies between assets. In addition, the integration of a momentum signal, which is generated from Kalman-filtered spread dynamics, provides the ability to seize short-term mispricings.
+
+This approach allows for the systematic identification of emotionally driven divergences in ETF spreads, facilitating the opportunity to benefit from their eventual reversion. Essentially, it capitalizes on behavioral inefficiencies within a rules-based, systematic framework.
+
+## Qualitative Methodology Explanation
+
+Explaining the copula-momentum strategy to clients may be difficult. This difficulty is due to the immense technical component related to the strategy. In order to explain how the strategy works from a logical standpoint, this section was created.
+
+The copula-momentum strategy applies a rules based system to investing. The strategy takes advantage of mispriced assets across the United States stock market through relating their uncertainty amongst one another. Two assets are traded at one time, which allows for the strategy to capitalize on the relative mispricing, better known as spread, between them. This mispricing, due to uncertainty, is caused by investor bias and inefficient investing practices. 
+The copula-momentum strategy actively searches for pairs of assets that should not experience this uncertainty at the same time. It does this through a mathematical function called the copula process. This math process creates probabilities that demonstrate how likely two assets are to experience uncertainty at the same time. This acts as the strategies initial screener, which tells the system the two assets to look at investing in. The market shows that there is always a discrepancy in uncertainty; however the copula process demonstrates which one is likely to experience no uncertainty. This allows the copula-momentum strategy to profit from uncertainty when it is unfairly represented.
+
+Momentum signals are the primary decision making tool for whether or not to invest in the pair of assets selected in the copula process. Momentum in finance refers to the tendency of an asset's price to continue moving in the same direction, either upward or downward, for a period of time. In the copula-momentum strategy, momentum is measured through a mathematical process called the Kalman-filter, which is used to estimate hidden trends or states from rapidly changing data. It continuously adjusts predictions based on new information, making it ideal for filtering out short-term fluctuations while capturing the underlying direction. In the case of the copula-momentum strategy, the difference between the two selected assets is passed through the filter to determine the “true momentum” which doesn’t include fluctuations. This allows the strategy to generate predictor values, which are used in judging whether or not enter positions.
+
+## Data Overview
+
+Nine highly liquid U.S. sector ETFs were selected for this strategy:
+
+```{r, echo=FALSE, warning=FALSE}
+
+knitr::kable(x = ticker.table, format = "html") 
+
+```
+
+
+Daily adjusted closing prices are retrieved from January 1, 2020, to April 8, 2025. The model is trained on data from January 1, 2020 December 31, 2022. The out-of-sample backtest is conducted from January 1, 2023, to the present.
+
+## Research & Signal Construction
+
+### Crash Risk Estimation via Copulas
+
+During each day within the training window, 30-day changes in volatility across all ETFs are analyzed. These changes are transformed into pseudo-observations through a ranking methodology, which eliminates scale effects and facilitates robust joint modeling.
+Using a rolling 91-day window, we evaluate every ETF pair under five candidate copula types  (Gaussian, t, Clayton, Gumbel, and Frank). Each model is fitted using maximum likelihood estimation (MLE) via the `copula:fitCopula()` function from R's package, ensuring the parameters are statistically optimized based on historical data. We then compute the Akaike Information Criterion (AIC) for each fit, selecting the copula with the lowest AIC as the best model for that pair. As a result of speed challenges, a C++ function was implemented with simplified MLE assumptions. This opens the strategy to model risk, however dramatically increases the performance of the system.
+
+```{r, echo=FALSE, warning=FALSE}
+
+ggplot2::ggplot(copula_outputs, aes(x = as.Date(date), y = ETF, fill = CrashProbability)) +
+  geom_tile() +
+  scale_fill_viridis_c(labels = scales::percent_format(accuracy = 1), name = "Crash Probability") +
+  labs(title = "Crash Probability by ETF Pair",
+       x = "Date", y = "ETF Pair", fill = "Crash Probability") +
+  theme(
+    panel.background = element_rect(fill = "white"),
+    plot.background = element_rect(fill = "white"),
+    axis.line = element_line(color = "black"),
+    panel.grid.major = element_line(color = "lightgrey"),
+    panel.grid.minor = element_line(color = "lightgrey"),
+    plot.title = element_text(size = 14),
+    axis.title.x = element_text(size = 10),
+    axis.title.y = element_text(size = 10),
+    axis.text.x = element_text(size = 5),
+    axis.text.y = element_text(size = 5),
+    legend.title = element_text(size = 10),
+    legend.text = element_text(size = 9),
+    legend.position = "right",
+    strip.background = element_blank(),
+    strip.text = element_text(size = 6)
+  ) 
+
+```
+
+For the chosen copula model, the joint crash probability is calculated, representing the likelihood of both ETFs undergoing volatility shocks beyond their respective 5th percentiles. This measure reflects the risk of concurrent emotional reactions between the two assets. The pair with the minimal joint crash probability in volatility is then selected for trading on that day.
+
+### Spread Momentum Forecasting
+
+Advanced statistical techniques are employed to analyze financial spreads by estimating momentum and forecasting directional trends. The objective is to extract meaningful signals from noisy data, enabling robust trading strategies and risk modeling. By combining Kalman filtering and Ornstein-Uhlenbeck processes, dynamic momentum estimation and predictive capabilities are achieved. This method is utilized only in the training sample, and the parameters are applied to the backtest period. Implementing the strategy would require the parameters constantly be updated to reflect the market conditions.
+
+The Kalman filter is applied to estimate momentum in 30-day ETF spreads by extracting a smoothed latent trend. The core goal is to distinguish persistent directional movements from short-term noise. The input variable, defined as the log return of the spread, provides a stabilized and scale-invariant representation of price dynamics. For each time step beyond an initial lookback period, a rolling window approach isolates recent observations to estimate the underlying momentum signal.
+
+The Kalman-filter is defined as a univariate state-space model with a local level component. This is formally represented by:
+
+$$ y_t = \mu_t + \epsilon_t $$
+$$ \mu_{t+1} = \mu_t + \eta_t $$
+where:
+
++ (y): Observed log return at time (t)
++ (μ): Latent momentum component
++ (ε): Observation noise (Gaussian disturbance with variance (H))
++ (Nu): Process noise (Gaussian disturbance with variance (Q))
+
+Both variances are unknown and are estimated via maximum likelihood using the Broyden–Fletcher–Goldfarb–Shanno (BFGS) optimization algorithm.
+
+Following estimation, Kalman filtering and smoothing recursions extract filtered state estimates, which serve as momentum signals. The most recent filtered state within each window is recorded as the momentum value for that period. This yields a time series of momentum estimates that dynamically adapt to changes in the underlying distribution of spreads, capturing evolving trends while filtering out fluctuations.
+
+After selecting an ETF pair, the return spread is computed, and the Kalman filter is applied to estimate the latent trend within the spread. The smoothed trend serves as input for fitting an Ornstein-Uhlenbeck process, enabling the estimation of critical parameters. These ETF-spread specific critical parameters are calculated in the model training period, and remain constant for the entirety of the backtest period.
+
+During the backtest, momentum values are forecasted based on the Ornstein-Uhlenbeck (OU) process. Trading signals are generated accordingly:
+
++ Speed of Reversion: Reflecting how quickly the spread returns to its mean.
++ Long-term Mean: Indicating the average value to which the spread reverts.
++ Volatility: Measuring the degree of fluctuation in the spread
+
+These parameters are calculated for each pair, and are applied during the backtest period.
+
+```{r, echo=FALSE, warning=FALSE}
+
+html.fitout <- fitOU_results %>% 
+  dplyr::mutate(Pair = name,
+                Theta = round(theta, 2),
+                 Mu = scales::percent(mu, accuracy = 0.01),
+                 Sigma = scales::percent(sigma, accuracy = 0.01)
+                  ) %>% 
+  dplyr::select(Pair, Theta, Mu, Sigma)
+  
+
+knitr::kable(x = html.fitout, format = "html")
+
+```
+
+The OU process was chosen as the method of modeling spread dynamics due to their mean reverting nature. This relationship can be observed below:
+
+```{r, echo=FALSE, warning=TRUE}
+
+mom1 <- momentum_ts %>% 
+  dplyr::filter((date >= "2022-01-01") & (date <= "2022-12-31"))
+
+mom.plot <- ggplot2::ggplot(mom1, aes(x = momentum, fill = name)) +
+  geom_histogram(position = "identity", alpha = 0.5, bins = 30) +
+  labs(title = "Distribution of Kalman-Filter Momentum",
+       subtitle = "Distributions Reflect The 2022 Year (Not The Full Sample Period)",
+       x = "Momentum",
+       y = "Frequency",
+       fill = "ETF Pair") +
+  scale_x_continuous(labels = scales::percent) +
+  theme(
+    panel.background = element_rect(fill = "white"),
+    plot.background = element_rect(fill = "white"),
+    axis.line = element_line(color = "black"),
+    panel.grid.major = element_line(color = "lightgrey"),
+    panel.grid.minor = element_line(color = "lightgrey"),
+    plot.title = element_text(size = 14),
+    axis.title.x = element_text(size = 10),
+    axis.title.y = element_text(size = 10),
+    axis.text.x = element_text(size = 5),
+    axis.text.y = element_text(size = 5),
+    legend.title = element_text(size = 10),
+    legend.text = element_text(size = 5),
+    legend.position = "right",
+    legend.key.size = unit(0.3, "cm"),
+    strip.background = element_blank(),
+    strip.text = element_text(size = 6)
+  ) 
+
+mom.plot
+
+```
+
+Combining Kalman filtering with Ornstein-Uhlenbeck processes provides a dynamic and adaptive framework for momentum estimation and trading signal generation. These techniques allow for precise measurement and forecasting, improving the reliability of spread-based trading strategies while addressing the complexities of financial market behavior
+
+## Position Sizing & Execution Rules
+
+Each day a copula process is calculated using a 91 day lookback window. This provides the strategy with the current optimized pair. Utilizing the spread from this pair and the OU parameters, a momentum signal is generated. If the momentum signal is stronger than the previous trade, an order is executed. The system does not require positions in existing spread trades to be closed, prior to a new position being opened.
+
+For the chosen ETF pair:
+
++ The ETF with expected momentum outperformance is given a long position; in contrast the underperformer is short sold.
+Each ETF’s weight is inversely proportional to its 30-day volatility.
++ The weights are normalized such that the sum of absolute weights $(|W1| + |W2|) =1$.
++ The position is held for a number of days equal to $\frac{252}{\theta}$, derived from the mean reversion speed. This is a fixed constraint that does not change given any external factors.
+
+```{r, echo=FALSE, warning=FALSE}
+
+vol.plot <- ggplot2::ggplot(transactData, aes(x = date, y = rollingVol, color = symbol)) + 
+  geom_line(size = 0.6) +
+  labs(title = "30-Day Rolling Volatility Per Position",
+       x = "Date",
+       y = "Rolling Volatility",
+       color = "ETF Pair") +
+  scale_y_continuous(labels = scales::percent) + 
+  theme(
+    panel.background = element_rect(fill = "white"),
+    plot.background = element_rect(fill = "white"),
+    axis.line = element_line(color = "black"),
+    panel.grid.major = element_line(color = "lightgrey"),
+    panel.grid.minor = element_line(color = "lightgrey"),
+    plot.title = element_text(size = 12),
+    axis.title.x = element_text(size = 10),
+    axis.title.y = element_text(size = 10),
+    axis.text.x = element_text(size = 8),
+    axis.text.y = element_text(size = 8),
+    legend.title = element_text(size = 10),
+    legend.text = element_text(size = 7),
+    legend.position = "right",
+    legend.key.size = unit(0.3, "cm"),
+    strip.background = element_blank(),
+    strip.text = element_text(size = 6)
+  )
+
+plotly::ggplotly(vol.plot)
+
+```
+
+
+__Important Execution Assumption:__ Daily portfolio returns are computed by averaging the returns of all open trades on each day. This implicitly assumes that positions are rebalanced daily to maintain equal capital exposure, despite weights being computed at trade entry. We acknowledge this as a simplification that ensures consistent portfolio sizing across time; however would result in high transaction costs. 
+
+__Important Position Assumption:__ The strategy assumes that the markets remain liquid at all times. Additionally, It assumes that transactions have no price impact and short-selling remains possible for each asset at a fixed annualized cost. 
+
+## Incorporating Transaction Costs
+
+In calculating strategy returns, an adjustment for transaction costs and short-sale borrowing fees are assumed to remain static.
+
++ Bid-Ask Spreads: Added for short positions and subtracted for long positions.
++ Short Sale Costs: Charged daily based on ETF-specific annualized borrow rates.
+
+Costs are embedded directly into the adjusted returns prior to calculating daily portfolio profit and loss. The costs associated with each product can be observed here:
+
+```{r, echo=FALSE, warning=FALSE}
+html.costs <- etf_data %>% 
+  dplyr::mutate(
+                Transactions = scales::percent(Bid_Ask, accuracy = 0.01),
+                 ShortSale = scales::percent(Short_Sale_Cost / 100, accuracy = 0.01),
+                  ) %>% 
+  dplyr::select(ETF, Transactions, ShortSale)
+  
+
+knitr::kable(x = html.costs, format = "html")
+```
+
+
+## Sensitivity Analysis: Impact of Leverage on Strategy Returns
+
+In the base case, the strategy was implemented with a leverage level of 1 (L = 1), indicating full investment without the use of any leverage. This serves as the benchmark, providing a clear reference point with standard exposure and no borrowing.
+
+$$|w_1|+|w_2| = L = 1$$
+
+This ensures that all capital is deployed with no borrowing, serving as our baseline setup.
+
+To analyze the impact of increased risk, the full trade simulation was conducted using leverage levels ranging from 1 to 4 (L = 1 to L = 4). The weights were adjusted to ensure that the total exposure consistently matched the target leverage. All other parameters, including trades and costs, remained unchanged, with only the position sizes being scaled up.
+
+## Strategy vs SPY: Cumulative Returns by Leverage Level
+
+The strategy's performance is evaluated in comparison to SPY across a range of leverage levels. This assessment highlights how the strategy fares under varying degrees of leverage exposure. The detailed results of this performance comparison are as follows:
+
+```{r, echo=FALSE, warning=FALSE}
+
+leveraged
+
+```
+
+
+## Sensitivity Observations
+
++ The performance of the strategy demonstrates significant scaling as leverage increases. At a leverage level of 4 (L = 4), the strategy achieves substantial outperformance compared to SPY, highlighting its effectiveness under higher levels of risk exposure.
++ Even at leverage levels of 2 or 3 (L = 2 or L = 3), the strategy consistently outperforms SPY. This indicates that achieving a strong advantage does not require excessive leverage, demo
++ Bid-ask spreads and short sale costs were systematically accounted for, yet the returns continued to increase at higher leverage levels. This indicates that transaction costs are not hindering performance, even as leverage rises, underscoring the strategy's resilience and efficiency in managing associated costs
+
+## Optimization Analysis: Impact of Transaction and Short-Sale Costs
+
+In analyzing the impact of transaction and short sale costs on profitability (PnL) across various ETF spreads. The x-axis represents short sale costs, ranging from 0.0% to 2.0%, while the y-axis displays transaction costs, varying from 0.0% to 0.5%. Each heatmap corresponds to a specific ETF pair, using a color scale from red (negative profitability) to blue (positive profitability) to visualize outcomes under different cost conditions.
+
+```{r, echo=FALSE, warning=FALSE}
+
+sensitivity_costs
+
+```
+
+
+The results reveal notable differences in the performance of these spreads. Certain pairs, such as XLB-XLF, exhibit resilience, maintaining positive returns (blue zones) across a broader range of cost scenarios. This suggests that these spreads are less sensitive to cost increases and thus more viable under varying conditions. In contrast, spreads like XLB-XLE experience a sharper decline in profitability as costs rise, with red zones dominating under higher transaction and short sale costs. Across all spreads, the optimal conditions for profitability occur when both cost types are minimized, reinforcing the importance of cost control. Ultimately, the results highlight that spreads with greater resilience, such as XLB-XLF, offer strategic advantages, while careful cost management remains critical for maximizing returns. In considering this analysis, it is clear that certain spreads better fit the overall strategy. This is driven by the combined low transaction costs and the low Theta parameter which prolongs how long the position is held on the book for.
+
+## Risk Appetite
+
+In defining investors' risk appetite related to the copula-momentum strategy, the Omega ratio, Sharpe ratio, and maximum drawdown analysis were applied. In completing the analysis, the optimal client is defined as an accredited investor. Accredited investors are those who meet certain income or net worth criteria, allowing them to invest in complex or sophisticated types of securities that are not closely regulated. The nature of the strategy involves short-selling and the use of leverage to balance portfolios.
+
+The risk-adjusted performance of the CopulaMomentum strategy was analyzed using three key metrics: the Sharpe Ratio, the Omega Ratio, and Maximum Drawdown. These metrics provide insights into the strategy's efficiency in generating returns, its performance relative to downside risk, and its behavior during periods of market stress.
+
+```{r, echo=FALSE, warning=FALSE}
+
+html.risk <- risk.metrics %>%
+  dplyr::mutate(
+    Value = dplyr::case_when(
+      Metric == "Sharpe Ratio (Annualized)" ~ round(Value, 2),
+      Metric == "Omega Ratio" ~ round(Value, 2),
+      TRUE ~ Value 
+    )
+  ) %>%
+  dplyr::mutate(
+    Value = dplyr::case_when(
+      Metric == "Maximum Drawdown" ~ scales::percent(Value, accuracy = 0.01), 
+      TRUE ~ as.character(Value)
+    )
+  )
+
+knitr::kable(x = html.risk, format = "html")
+
+```
+
+__Sharpe Ratio__
+
+The strategy demonstrates a strong return relative to its volatility, which is a notable achievement given that such high ratios are rarely observed in practice. While this performance suggests the model may be effectively capturing persistent return signals and managing volatility, it is important to account for nuances. For instance, inflated Sharpe Ratios can sometimes arise under extreme market conditions, small sample sizes, or overfitting during backtesting.
+
+__Omega Ratio__
+
+The Omega Ratio implies that the expected upside returns are more than double the downside risk (relative to a 0% threshold). This is a healthy sign, especially for long/short strategies where traditional metrics like Sharpe may not fully capture skewed distributions.
+
+__Max Drawdown__
+
+The maximum drawdown reflects the worst observed peak-to-trough decline in strategy equity. This is relatively shallow and suggests strong downside protection and risk controls. The drawdown chart confirms that pullbacks have been brief and contained, with no periods of prolonged distress. However, it should be noted that no single pair trade is ever held for longer than 15 consecutive days, which provides clear evidence that the max drawdown should remain shallow.
+
+```{r, echo=FALSE, warning=FALSE}
+
+chart.Drawdown(strategy_returns, main = "Strategy Drawdown", geometric = TRUE, plot = FALSE)
+
+```
+
+The drawdown graph shows that while the strategy does experience frequent small dips, these losses are generally shallow and short-lived. The largest drawdown over the period was just 2.71%, and recoveries tended to follow quickly. There are no long periods of sustained losses, which suggests that the model manages risk well and adapts effectively through its pair selection and rebalancing approach.
+
+## Key Assumptions
+The model assumes that sector-based ETFs exhibit a level of volatility and momentum that can be measured. Volatility shocks are assumed to occur during moments of market stress or sentiment-driven dislocation, however should not occur in both positions at the same time. The model further assumes that extreme market events, such as margin calls or large sell-offs, follow predictable patterns in response to changes in volatility and sentiment, and these events are factored into the position-sizing mechanism.
+
+The model also assumes that the copula function used for joint risk calculations provides an accurate reflection of the dependency structure between different ETFs across various sectors. For the sake of performance, some components of the copula function are hard coded and assumed to be true. 
+In terms of trading assumptions, the model presumes that transaction costs, including short-sale fees and bid-ask spreads, are fixed. However, it should be noted that in times of extreme market volatility, liquidity constraints could lead to higher transaction costs than anticipated.
+
+Lastly, the model assumes that the relationship between risk and return within sector ETFs holds steady enough for backtesting to accurately represent future performance. While out-of-sample testing is conducted to validate the strategy, the model assumes a reasonable level of consistency in market conditions over time.
+
+## Model Learnings
+
+An analysis of the model suggests that the United States equities market may not be ideal for implementing the copula-momentum strategy. This is primarily due to the high price correlation among assets and the significant transaction costs involved. Although the strategy effectively filters momentum using the Kalman filter, the continuous trading model may require refinement. Specifically, positions should meet defined thresholds rather than merely exceeding the strength of the previous signal. In implementing the model, the Kalman filter was an interesting tool to learn, as its effectiveness across a range of tasks is clear. 
+
+The copula process proves effective in identifying ETF pairs with low crash probabilities. However, the model's simplified structure could be expanded to provide a more accurate estimation of the shape and properties of the distributions. This refinement would enhance the model's robustness and applicability across different market conditions. In implementing the model, understanding the different distributions proved to be a useful challenge which can be implemented in other areas of research.
+
+Overall, while the copula-momentum strategy has demonstrated promise, particularly in ETF pair selection and momentum filtering, its applicability to the U.S. equity market is limited by high correlations and transaction costs. A more dynamic approach to modeling the copula's dependence structure, combined with improved risk thresholds for trading signals, would enhance its robustness and adaptability to different market conditions.
