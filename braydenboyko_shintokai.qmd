@@ -366,14 +366,7 @@ costSensitivity <- function(sens, ssc_values, transaction_costs) {
 
 ```
 
-```{Rcpp, echo=FALSE, warning=FALSE
-
-
-
-
-
-
-}
+```{Rcpp, echo=FALSE, warning=FALSE}
 #include <Rcpp.h>
 #include <vector>
 #include <string>
@@ -534,7 +527,7 @@ Rcpp::DataFrame analyzeRollingCopulas(
 ```
 
 
-```{r dataCollect, echo=FALSE, warning=FALSE}
+```{r dataCollect, echo=FALSE, warning=FALSE, message=FALSE}
 
 tickers <- c("XLK",  # Technology
              "XLV",  # Health Care
@@ -601,7 +594,7 @@ vol.wide <- vol %>%
 
 ```
 
-```{r copula, echo=FALSE, warning=FALSE}
+```{r copula, echo=FALSE, warning=FALSE, message=FALSE}
 
 copula_outputs <- analyzeRollingCopulas(vol.wide, 91, 0.05, 0.05) %>% 
   dplyr::mutate(ETF = paste0(ETF_1, "_", ETF_2)) %>% 
@@ -614,7 +607,7 @@ positions <- copula_outputs %>% ## Provides DF Of HoldingS (Spread) On Each Date
 
 ```
 
-```{r momentum, echo=FALSE, warning=FALSE}
+```{r momentum, echo=FALSE, warning=FALSE, message=FALSE}
 
 momentum_ts <- spreads.train %>%
   dplyr::group_by(name) %>%
@@ -659,7 +652,7 @@ fitOU_results <- momentum_ts %>%
 
 ```
 
-```{r research, echo=FALSE, warning=FALSE}
+```{r research, echo=FALSE, warning=FALSE, message=FALSE}
 #| output: FALSE
 
 chart <- momentum_ts %>%
@@ -750,7 +743,7 @@ p3 <- plotly::ggplotly(chart2)
 research_example_chart <- plotly::subplot(p1, p2, p3,nrows = 3, shareX = T)
 ```
 
-```{r compile, echo=FALSE, warning=FALSE}
+```{r compile, echo=FALSE, warning=FALSE, message=FALSE}
 
 signalData <- spreads %>% 
   dplyr::left_join(fitOU_results, by="name")
@@ -770,7 +763,7 @@ transactData <- data %>%
 
 ```
 
-```{r model, echo=FALSE, warning=FALSE}
+```{r model, echo=FALSE, warning=FALSE, message=FALSE}
 
 modelRun <- transactData %>% 
   dplyr::mutate(
@@ -815,7 +808,7 @@ transactions_close <- modelRun %>%
 
 ```
 
-```{r Spread Graph, echo=FALSE, warning=FALSE}
+```{r Spread Graph, echo=FALSE, warning=FALSE, message=FALSE}
 
 spread_momentum_merged <- spreads %>%
   left_join(momentum_ts, by = c("date", "name")) %>%
@@ -852,7 +845,7 @@ signal_plots <- patchwork::wrap_plots(spread_signal_charts, ncol = 6)
 
 ```
 
-```{r Equity Curve, echo=FALSE, warning=FALSE}
+```{r Equity Curve, echo=FALSE, warning=FALSE, message=FALSE}
 
 ## COST TABLE
 etf_data <- dplyr::tibble(
@@ -946,7 +939,7 @@ combined_backtest_long <- combined_backtest %>%
 
 ```
 
-```{r Pair Rotation Time Line, echo=FALSE, warning=FALSE}
+```{r Pair Rotation Time Line, echo=FALSE, warning=FALSE, message=FALSE}
 
 active_positions <- modelRun %>%
   dplyr::filter(Trades == 1) %>%
@@ -1143,7 +1136,7 @@ backtestResults <- plotly::subplot(
 
 ```
 
-```{r Weight Sensitivity Analysis, echo=FALSE, warning=FALSE, results='hide'}
+```{r Weight Sensitivity Analysis, echo=FALSE, warning=FALSE, results='hide', message=FALSE}
 # Filter for L = 1:4 
 L_selected <- c(1, 2, 3, 4)
 
@@ -1206,7 +1199,7 @@ leveraged <- wrap_plots(plot_list, ncol = 2)
 
 ```
 
-```{r performance analysis, echo=FALSE, warning=FALSE}
+```{r performance analysis, echo=FALSE, warning=FALSE, message=FALSE}
 
 strategy_returns <- pnl_full_backtest %>%
   dplyr::select(date, pnl) %>%
@@ -1230,7 +1223,7 @@ dd_table <- table.Drawdowns(strategy_returns)
 ```
 
 
-```{r transaction cost optimization, echo=FALSE, warning=FALSE}
+```{r transaction cost optimization, echo=FALSE, warning=FALSE, message=FALSE}
 
 ssc_values <- seq(0, 0.02, length.out = 50)
 transaction_costs <- seq(0, 0.005, length.out = 50)
@@ -1292,7 +1285,7 @@ The Copula-Momentum strategy introduces a systematic trading approach that merge
 
 The following analysis highlights the robust performance observed in the strategy's backtest results. The cumulative return chart reveals consistent outperformance compared to the SPY benchmark throughout the backtest period. However, this superior performance is crippled by realistic transaction costs. This is due to constant trading, as a result of extremely quick reversions in volatility momentum.
 
-```{r, echo=FALSE, warning=FALSE}
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
 
 backtestResults
 
@@ -1304,7 +1297,6 @@ Complementing this, the positions component of the visual, presents a heatmap of
 Adding to these findings, the strategy exhibits adaptability across various market conditions. The active rotation across sector pairs, combined with high turnover efficiency, underscores its dynamic nature. The strong performance appears to be driven by the strategic selection of pairs through copula filtering and the precise directional timing achieved via Kalman-filter-based momentum. Should the strategy be refined to capture longer term momentum, reducing trading costs; it may be viable to implement. 
 
 In the case of extending the hold period, the portfolio is exposed to greater potential for unexpected volatility shocks, which can be observed across all ETF pairs below. This can dismantle the portfolio and leave the investor exposed to margin calls and infinite loss. Thus it is deemed impossible to implement longer holding periods in the United States equities market.
-Insert Research Chart
 
 ## Behavioural Rationale
 
@@ -1328,7 +1320,7 @@ Momentum signals are the primary decision making tool for whether or not to inve
 
 Nine highly liquid U.S. sector ETFs were selected for this strategy:
 
-```{r, echo=FALSE, warning=FALSE}
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
 
 knitr::kable(x = ticker.table, format = "html") 
 
@@ -1344,7 +1336,7 @@ Daily adjusted closing prices are retrieved from January 1, 2020, to April 8, 20
 During each day within the training window, 30-day changes in volatility across all ETFs are analyzed. These changes are transformed into pseudo-observations through a ranking methodology, which eliminates scale effects and facilitates robust joint modeling.
 Using a rolling 91-day window, we evaluate every ETF pair under five candidate copula types  (Gaussian, t, Clayton, Gumbel, and Frank). Each model is fitted using maximum likelihood estimation (MLE) via the `copula:fitCopula()` function from R's package, ensuring the parameters are statistically optimized based on historical data. We then compute the Akaike Information Criterion (AIC) for each fit, selecting the copula with the lowest AIC as the best model for that pair. As a result of speed challenges, a C++ function was implemented with simplified MLE assumptions. This opens the strategy to model risk, however dramatically increases the performance of the system.
 
-```{r, echo=FALSE, warning=FALSE}
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
 
 ggplot2::ggplot(copula_outputs, aes(x = as.Date(date), y = ETF, fill = CrashProbability)) +
   geom_tile() +
@@ -1404,7 +1396,7 @@ During the backtest, momentum values are forecasted based on the Ornstein-Uhlenb
 
 These parameters are calculated for each pair, and are applied during the backtest period.
 
-```{r, echo=FALSE, warning=FALSE}
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
 
 html.fitout <- fitOU_results %>% 
   dplyr::mutate(Pair = name,
@@ -1453,27 +1445,28 @@ mom.plot <- ggplot2::ggplot(mom1, aes(x = momentum, fill = name)) +
     strip.text = element_text(size = 6)
   ) 
 
-mom.plot
+plotly::ggplotly(mom.plot)
 
 ```
 
-Combining Kalman filtering with Ornstein-Uhlenbeck processes provides a dynamic and adaptive framework for momentum estimation and trading signal generation. These techniques allow for precise measurement and forecasting, improving the reliability of spread-based trading strategies while addressing the complexities of financial market behavior
+Combining Kalman filtering with Ornstein-Uhlenbeck processes provides a dynamic and adaptive framework for momentum estimation and trading signal generation. These techniques allow for precise measurement and forecasting, improving the reliability of spread-based trading strategies while addressing the complexities of financial market behavior.
 
 ## Position Sizing & Execution Rules
 
 Each day a copula process is calculated using a 91 day lookback window. This provides the strategy with the current optimized pair. Utilizing the spread from this pair and the OU parameters, a momentum signal is generated. If the momentum signal is stronger than the previous trade, an order is executed. The system does not require positions in existing spread trades to be closed, prior to a new position being opened.
 
-For the chosen ETF pair:
+__For the chosen ETF pair:__
 
 + The ETF with expected momentum outperformance is given a long position; in contrast the underperformer is short sold.
 Each ETF’s weight is inversely proportional to its 30-day volatility.
 + The weights are normalized such that the sum of absolute weights $(|W1| + |W2|) =1$.
 + The position is held for a number of days equal to $\frac{252}{\theta}$, derived from the mean reversion speed. This is a fixed constraint that does not change given any external factors.
 
-```{r, echo=FALSE, warning=FALSE}
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
 
 vol.plot <- ggplot2::ggplot(transactData, aes(x = date, y = rollingVol, color = symbol)) + 
   geom_line(size = 0.6) +
+  facet_wrap(~ symbol, scales = "free_y", ncol = 3) + 
   labs(title = "30-Day Rolling Volatility Per Position",
        x = "Date",
        y = "Rolling Volatility",
@@ -1485,11 +1478,11 @@ vol.plot <- ggplot2::ggplot(transactData, aes(x = date, y = rollingVol, color = 
     axis.line = element_line(color = "black"),
     panel.grid.major = element_line(color = "lightgrey"),
     panel.grid.minor = element_line(color = "lightgrey"),
-    plot.title = element_text(size = 12),
+    plot.title = element_text(size = 10),
     axis.title.x = element_text(size = 10),
     axis.title.y = element_text(size = 10),
-    axis.text.x = element_text(size = 8),
-    axis.text.y = element_text(size = 8),
+    axis.text.x = element_text(size = 6),
+    axis.text.y = element_text(size = 6),
     legend.title = element_text(size = 10),
     legend.text = element_text(size = 7),
     legend.position = "right",
@@ -1516,7 +1509,7 @@ In calculating strategy returns, an adjustment for transaction costs and short-s
 
 Costs are embedded directly into the adjusted returns prior to calculating daily portfolio profit and loss. The costs associated with each product can be observed here:
 
-```{r, echo=FALSE, warning=FALSE}
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
 html.costs <- etf_data %>% 
   dplyr::mutate(
                 Transactions = scales::percent(Bid_Ask, accuracy = 0.01),
@@ -1535,7 +1528,7 @@ In the base case, the strategy was implemented with a leverage level of 1 (L = 1
 
 $$|w_1|+|w_2| = L = 1$$
 
-This ensures that all capital is deployed with no borrowing, serving as our baseline setup.
+This ensures that all capital is deployed with no borrowing, serving as the baseline setup.
 
 To analyze the impact of increased risk, the full trade simulation was conducted using leverage levels ranging from 1 to 4 (L = 1 to L = 4). The weights were adjusted to ensure that the total exposure consistently matched the target leverage. All other parameters, including trades and costs, remained unchanged, with only the position sizes being scaled up.
 
@@ -1543,24 +1536,24 @@ To analyze the impact of increased risk, the full trade simulation was conducted
 
 The strategy's performance is evaluated in comparison to SPY across a range of leverage levels. This assessment highlights how the strategy fares under varying degrees of leverage exposure. The detailed results of this performance comparison are as follows:
 
-```{r, echo=FALSE, warning=FALSE}
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
 
 leveraged
 
 ```
-
+__Important Display Assumption:__ The leverage sensitivity analysis was run under the assumption of no transaction or short sale costs. This analysis elected to isolate the the leverage component related to portfolio weightings to demonstrate its significance.
 
 ## Sensitivity Observations
 
 + The performance of the strategy demonstrates significant scaling as leverage increases. At a leverage level of 4 (L = 4), the strategy achieves substantial outperformance compared to SPY, highlighting its effectiveness under higher levels of risk exposure.
-+ Even at leverage levels of 2 or 3 (L = 2 or L = 3), the strategy consistently outperforms SPY. This indicates that achieving a strong advantage does not require excessive leverage, demo
-+ Bid-ask spreads and short sale costs were systematically accounted for, yet the returns continued to increase at higher leverage levels. This indicates that transaction costs are not hindering performance, even as leverage rises, underscoring the strategy's resilience and efficiency in managing associated costs
++ Even at leverage levels of 2 or 3 (L = 2 or L = 3), the strategy consistently outperforms SPY. This indicates that achieving a strong advantage does not require excessive leverage.
++ Bid-ask spreads and short sale costs were systematically accounted for, yet the returns continued to increase at higher leverage levels. This indicates that transaction costs are not hindering performance, even as leverage rises, underscoring the strategy's resilience and efficiency in managing associated costs.
 
-## Optimization Analysis: Impact of Transaction and Short-Sale Costs
+### Optimization Analysis: Impact of Transaction and Short-Sale Costs
 
 In analyzing the impact of transaction and short sale costs on profitability (PnL) across various ETF spreads. The x-axis represents short sale costs, ranging from 0.0% to 2.0%, while the y-axis displays transaction costs, varying from 0.0% to 0.5%. Each heatmap corresponds to a specific ETF pair, using a color scale from red (negative profitability) to blue (positive profitability) to visualize outcomes under different cost conditions.
 
-```{r, echo=FALSE, warning=FALSE}
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
 
 sensitivity_costs
 
@@ -1575,7 +1568,7 @@ In defining investors' risk appetite related to the copula-momentum strategy, th
 
 The risk-adjusted performance of the CopulaMomentum strategy was analyzed using three key metrics: the Sharpe Ratio, the Omega Ratio, and Maximum Drawdown. These metrics provide insights into the strategy's efficiency in generating returns, its performance relative to downside risk, and its behavior during periods of market stress.
 
-```{r, echo=FALSE, warning=FALSE}
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
 
 html.risk <- risk.metrics %>%
   dplyr::mutate(
@@ -1608,9 +1601,9 @@ __Max Drawdown__
 
 The maximum drawdown reflects the worst observed peak-to-trough decline in strategy equity. This is relatively shallow and suggests strong downside protection and risk controls. The drawdown chart confirms that pullbacks have been brief and contained, with no periods of prolonged distress. However, it should be noted that no single pair trade is ever held for longer than 15 consecutive days, which provides clear evidence that the max drawdown should remain shallow.
 
-```{r, echo=FALSE, warning=FALSE}
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
 
-chart.Drawdown(strategy_returns, main = "Strategy Drawdown", geometric = TRUE, plot = FALSE)
+chart.Drawdown(strategy_returns, main = "Strategy Drawdown", geometric = TRUE)
 
 ```
 
